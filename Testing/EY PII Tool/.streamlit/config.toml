@@ -1,0 +1,7 @@
+[theme]
+base = "dark"
+primaryColor = "#FFD400"            # EY yellow
+backgroundColor = "#111217"         # near-black canvas
+secondaryBackgroundColor = "#1A1C23"
+textColor = "#E5E7EB"               # light grey
+font = "sans serif"                 # we’ll inject Inter via CSS
