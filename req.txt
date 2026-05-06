@@ -15,6 +15,7 @@ colorama==0.4.6
 confection==0.1.5
 cryptography==46.0.5
 cymem==2.0.13
+en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl#sha256=1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85
 et_xmlfile==2.0.0
 gitdb==4.0.12
 GitPython==3.1.46
@@ -44,6 +45,7 @@ pydantic==2.12.5
 pydantic_core==2.41.5
 pydeck==0.9.1
 Pygments==2.19.2
+PyMuPDF==1.27.2.2
 PyPDF2==3.0.1
 pypdfium2==5.5.0
 pytesseract==0.3.13
@@ -51,9 +53,11 @@ python-dateutil==2.9.0.post0
 python-docx==1.2.0
 pytz==2025.2
 referencing==0.37.0
+reportlab==4.4.10
 requests==2.32.5
 rich==14.3.3
 rpds-py==0.30.0
+setuptools==82.0.1
 shellingham==1.5.4
 six==1.17.0
 smart_open==7.5.1
