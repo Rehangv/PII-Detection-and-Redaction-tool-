@@ -24,25 +24,21 @@ import posixpath
 try:
     import pypdfium2 as pdfium
 except Exception:
-    pdfium = None  # Will skip page render OCR if unavailable
+    pdfium = None  # page render OCR will be skipped if unavailable
 
-# OCR engine path (make it safe across OS)
 # Only set tesseract_cmd if the binary exists at this path (Windows users)
 _win_tesseract = r"C:\Users\BJ574SU\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
 if os.path.exists(_win_tesseract):
     pytesseract.pytesseract.tesseract_cmd = _win_tesseract
 
 
-# spaCy lazy loader (cached)
+# Load spaCy once and cache it
 from functools import lru_cache
 
 import streamlit as st
 @st.cache_resource(show_spinner=False)
 def get_nlp():
-    """
-    Load spaCy's en_core_web_sm once and reuse it.
-    Returns None if spaCy or the model isn't available.
-    """
+    """Load spaCy's en_core_web_sm once and reuse it. Returns None if the model isn't available."""
     try:
         import spacy  # local import avoids import errors at module import time
     except Exception:
@@ -75,10 +71,10 @@ pi_PATTERNS: Dict[str, str] = {
     # Common PII
     "email": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
 
-    # Phone  requires formatting chars to avoid matching bare digit strings
+    # Phone requires formatting chars to avoid matching bare digit strings
     "Phone": r"(?<!\d)(?:\+\d{1,3}[\s\-]?)?\(?\d{3}\)?[\s\-\.]\d{3}[\s\-\.]\d{4}\b",
 
-    # Account Number  context-gated in get_confidence (requires banking keywords)
+    # Account Number is context-gated in get_confidence (requires banking keywords)
     "Account Number": r"\b\d{9,18}\b",
 
     "SSN Number": r"\b\d{3}[\s]?-\d{2}[\s]?-\d{4}\b",
@@ -90,14 +86,19 @@ pi_PATTERNS: Dict[str, str] = {
     "Age": r"\b(?:1[01]\d|[1-9]?\d|120)\s*(?:years?|yrs?)\b",
     "Gender": r"\b(?:(?:male|female|transgender|non[-\s]?binary)|m/f)\b",
     "Credit/Debit Card": r"\b(?:3[47]\d{2}[-\s]?\d{6}[-\s]?\d{5}|(?:\d{4}[-\s]?){3}\d{4})\b",
-    "State Passport Number": r"\b[A-Z]{2}\d{7}\b",
 
     # Indian PII
+    # Aadhaar: 12 digits grouped XXXX XXXX XXXX, first digit 2-9
     "Aadhaar Number": r"\b[2-9]\d{3}[\s\-]{0,2}\d{4}[\s\-]{0,2}\d{4}\b",
+    # PAN Card: 5 letters + 4 digits + 1 letter e.g. ABCDE1234F
     "PAN Card":        r"\b[A-Z]{5}[0-9]{4}[A-Z]\b",
+    # IFSC: 4-5 letters + 0 + 6 alphanumeric e.g. HDFC0001234, KOTAK0005678
     "IFSC Code":       r"\b[A-Z]{4,5}0[A-Z0-9]{6}\b",
+    # Indian phone: starts 6-9, exactly 10 digits, optional +91 prefix
     "Indian Phone":    r"\b(?:\+91[\s\-]?)?[6-9]\d{9}\b",
-    "Voter ID":        r"\b(?!MRN)[A-Z]{3}[0-9]{7}\b",
+    # Voter ID: 3 uppercase letters + 7 digits
+    "Voter ID":        r"\b(?!MRN)[A-Z]{2,3}[0-9]{7}\b",
+    # IP Address
     "IP Address":      r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b",
 }
 
@@ -107,12 +108,12 @@ _ACCOUNT_KW_RE = re.compile(
     r"beneficiary|remit|remittance|payee|debit|credit)\b",
     re.IGNORECASE,
 )
-# Routing number specific keyword (9-digit ABA routing numbers)
+# Routing number keyword (9-digit ABA routing numbers)
 _ROUTING_KW_RE = re.compile(r"\b(?:routing|aba|sort\s*code)\b", re.IGNORECASE)
 _ROUTING_NUM_RE = re.compile(r"\b\d{9}\b")  # US ABA routing = exactly 9 digits
 
-# Explicit account keyword immediately before the number 
-# Used to override the Indian phone heuristic for 10-digit numbers starting 6-9
+# Checks if an explicit account keyword appears directly before the number (within 25 chars)
+# Used to override the Indian-phone heuristic for 10-digit numbers starting 6-9
 _EXPLICIT_ACCT_KW_RE = re.compile(
     r"\b(?:account|acct|a\/c|bank\s+account|account\s+(?:no|number|num))\s*[:\|]?\s*$",
     re.IGNORECASE,
@@ -127,10 +128,7 @@ def _has_account_context(ctx: str, col_name: str = "") -> bool:
     )
 
 def _is_explicit_account(value: str, full_text: str) -> bool:
-    """
-    Return True if an explicit account keyword appears directly before this value
-    in the full text (within 25 chars). Used to override Indian-phone heuristic.
-    """
+    """Return True if an explicit account keyword appears directly before this value (within 25 chars)."""
     idx = full_text.find(value)
     if idx < 0:
         return False
@@ -138,11 +136,18 @@ def _is_explicit_account(value: str, full_text: str) -> bool:
     return bool(_EXPLICIT_ACCT_KW_RE.search(window))
 
 def _is_routing_number(value: str, context: str) -> bool:
-    """Return True if this 9-digit number is adjacent to a routing keyword."""
+    """Return True only if a routing keyword appears within 30 chars before this value."""
     digits = re.sub(r"\D", "", value)
     if len(digits) != 9:
         return False
-    return bool(_ROUTING_KW_RE.search(context or ""))
+    if not _ROUTING_KW_RE.search(context or ""):
+        return False
+    # Only check the text before the value — not after (prevents passport being tagged)
+    idx = (context or "").find(value)
+    if idx < 0:
+        return False
+    window_before = context[max(0, idx - 30): idx]
+    return bool(_ROUTING_KW_RE.search(window_before))
 
 _VOTER_ID_CTX_RE = re.compile(r"\b(?:voter|epic|election|electoral)\b", re.IGNORECASE)
 _DL_CTX_STRONG_RE = re.compile(r"\b(?:driver\'?s?|driving|license|licence|dl)\b", re.IGNORECASE)
@@ -158,7 +163,7 @@ _MRN_CTX_RE = re.compile(
 def _has_mrn_context(ctx: str) -> bool:
     return bool(_MRN_CTX_RE.search(ctx or ""))
 
-# ---- US Passport ----
+# US Passport
 PASSPORT_KEYWORD = re.compile(r"\bpassport\b", re.IGNORECASE)
 PASSPORT_STRICT_RE = re.compile(r"^[A-Z]\d{8}$")
 PASSPORT_9D_RE     = re.compile(r"^\d{9}$")
@@ -190,20 +195,20 @@ ADDRESS_SUITE_PATTERN = re.compile(
     re.IGNORECASE
 )
 
-# US Driving Licenses 
+# US Driving Licenses
 US_DL_PATTERNS: Dict[str, str] = {
     "AL": r"\b\d{8}\b",  # Exact 8 digits
     "AK": r"\b\d{7}\b",
     "AZ": r"\b(?:AZ[\s\-–—]*)?(?P<az_core>[A-Z]\d{8})\b",
     "AR": r"\b\d{9}\b",  # Exact 9 digits (was 4,9)
     "CA": r"\b(?:CA[\s\-–—]*)?(?P<core>[A-Z]\d{7})\b", 
-        "CO": r"\b(?:CO[\s\-–—]*)?(?P<core>(?:\d{9}|[A-Z]\d{7,8}))\b", 
+        "CO": r"\b(?:CO[\s\-–—]*)?(?P<co_core>[A-Z]\d{7,8})\b",  # letter+digits only; bare \d{9} removed to avoid routing/passport confusion
     "CT": r"\b\d{9}\b",
     "DE": r"\b\d{7}\b",  # Exact 7 digits (was 1,7)
     "DC": r"\b\d{7}\b",
     "FL": r"\b(?:FL[\s\-–—]*)?[A-Z]\d{12}\b",
-    "GA": r"\b\d{9}\b",  # Exact 9 digits (was 7,9)
-    "HI": r"\b[A-Z]\d{9}\b",  # Exact 9 digits (was 8,9)
+    "GA": r"\b\d{9}\b",
+    "HI": r"\b[A-Z]\d{9}\b",
     "ID": r"\b[A-Z]{2}\d{6}\b",
     "IL": r"\b(?:IL[\s\-–—]*)?[A-Z]\d{11}\b",
     "IN": r"\b\d{10}\b",
@@ -245,8 +250,15 @@ US_DL_PATTERNS: Dict[str, str] = {
     "WY": r"\b\d{9}\b",
 }
 
-# Iowa DL placeholder removed to avoid SSN collision (was matching 3-2-4 like SSN)
+# Iowa DL pattern removed to avoid SSN collision (matches 3-2-4 like SSN)
 US_DL_PATTERNS.pop("IA", None)
+
+# States whose DL pattern is pure digits — very ambiguous.
+# We only emit them when a DL-specific column header is present (not just DL keyword in text).
+_PURE_DIGIT_DL_STATES = {
+    "AR", "GA", "IN", "LA", "ME", "MS", "NM", "NV", "OR", "PA",
+    "RI", "SC", "SD", "TN", "UT", "VT", "WY", "NC", "ND", "CT", "DC"
+}
 
 US_DL_MAX_LENGTH: Dict[str, int] = {
     "AL": 8, "AK": 7, "AZ": 9, "AR": 9, "CA": 8, "CO": 9, "CT": 9, "DC": 7, "DE": 7, "FL": 13,
@@ -257,7 +269,7 @@ US_DL_MAX_LENGTH: Dict[str, int] = {
     "VA": 12, "WA": 14, "WV": 7, "WI": 14, "WY": 9
 }
 
-# Minimum DL length for OCR validation (allows for some OCR errors)
+# Minimum DL length for OCR validation
 US_DL_MIN_LENGTH: Dict[str, int] = {
     "AL": 6, "AK": 7, "AZ": 9, "AR": 4, "CA": 8, "CO": 8, "CT": 9, "DE": 1, "FL": 13,
     "GA": 7, "HI": 9, "ID": 8, "IL": 12, "IN": 10, "IA": 8, "KS": 9, "KY": 10, "LA": 9,
@@ -267,15 +279,19 @@ US_DL_MIN_LENGTH: Dict[str, int] = {
     "VA": 9, "WA": 14, "WV": 7, "WI": 14, "WY": 9
 }
 
-# Company IDs (both numeric 6-digit and alphanumeric 13 letters + 48 digits)
+# Company IDs (both numeric 6-digit and alphanumeric EMP-prefixed)
 COMPANY_ID_PATTERN_NUM = r"\b\d{6}\b"
 COMPANY_ID_RE_NUM = re.compile(COMPANY_ID_PATTERN_NUM)
-ALNUM_COMPANY_ID_RE = re.compile(r"\b[A-Z]{1,3}\d{4,8}\b")
 
 COMPANY_ID_CONTEXT_RE = re.compile(
-    r"\b(?:company|employee|emp|staff|badge|payroll)\s*(?:id|#|number|no\.?|code|num)\b",
+    r"\b(?:company|employee|emp|staff|badge|payroll)\s*(?:id|#|number|no\.?|code|num)\b"
+    r"|\bcompany\s*id\s*[:\|]"   # "Company ID:" label
+    r"|\bemp(?:loyee)?\s*[:\|]", # "EMP:" or "Employee:" label
     re.IGNORECASE
 )
+
+# Also detect EMP-prefixed company IDs directly (e.g. EMP4821, EMP7721)
+ALNUM_COMPANY_ID_RE = re.compile(r"\b(?:EMP\d{4,8}|[A-Z]{1,3}\d{4,8})\b")
 
 COMPANY_ID_NEG_CONTEXT_RE = re.compile(
     r"\b(?:mrn|medical\s*record|insurance\s*id|policy(?:\s*(?:no|number))?|passport|routing|account|ach|iban|visa|mastercard|voter|aadhaar|aadhar|pan\s*card|dl|driver)\b",
@@ -288,29 +304,39 @@ def is_company_id(token: str, context: str | None = None) -> bool:
     looks_like = bool(ALNUM_COMPANY_ID_RE.fullmatch(token) or COMPANY_ID_RE_NUM.fullmatch(token))
     if not looks_like:
         return False
-    # Reject values that start with known MRN prefix (MRN0456789, MRN6475255)
+    # EMP-prefixed values are unambiguous
+    if re.match(r'^EMP\d+$', token, re.IGNORECASE):
+        return True
+    # reject MRN-prefixed
     if re.match(r'^MRN', token, re.IGNORECASE):
         return False
-    # Reject values that look like US passports (letter + 8 digits)
+    # reject passport format
     if re.match(r'^[A-Z]\d{8}$', token):
         return False
-    # Reject values that look like Voter IDs (3 letters + 7 digits)
-    if re.match(r'^[A-Z]{3}\d{7}$', token):
+    # reject Voter ID format
+    if re.match(r'^[A-Z]{2,3}\d{7}$', token):
+        return False
+    # reject INS-prefixed insurance IDs
+    if re.match(r'^INS', token, re.IGNORECASE):
         return False
     ctx = context or ""
     if COMPANY_ID_NEG_CONTEXT_RE.search(ctx):
         return False
     return bool(COMPANY_ID_CONTEXT_RE.search(ctx))
 
-# ---- MRN / Insurance ID ----
+# MRN / Insurance ID
 MRN_RE = re.compile(
-    r"\bMRN[\s:#-]*([A-Z0-9][A-Z0-9\-]{3,12})\b"   # MRN-KIM-4455, MRN0456789, MRN0310518
-    r"|\b(?:MRN[\s:#-]*)?([A-Z]{0,3}\d{6,10})\b",    # plain numeric MRNs with optional prefix
+    r"\bMRN[\s:#-]*([A-Z0-9][A-Z0-9\-]{3,12})\b"   # MRN-KIM-4455, MRN0456789
+    r"|\bMRN[\s:#-]*([A-Z]{0,3}\d{6,10})\b",         # MRN followed by digits (keyword required)
     re.IGNORECASE
 )
-INSURANCE_ID_RE = re.compile(r"\b(?:insurance\s*id|policy\s*id|policy\s*no\.?)\s*[:#-]?\s*([A-Z0-9-]{6,15})\b", re.IGNORECASE)
+INSURANCE_ID_RE = re.compile(
+    r"\b(?:insurance\s*id|policy\s*id|policy\s*no\.?)\s*[:#-]?\s*([A-Z0-9][A-Z0-9\-]{5,20})\b"
+    r"|\b(INS-[A-Z0-9][A-Z0-9\-]{4,18})\b",  # direct INS- prefix match
+    re.IGNORECASE
+)
 
-# ---- SSN tolerant (OCR variants) ----
+# SSN with OCR tolerance (handles spacing/dash variants)
 SSN_NEARBY_FLEX_RE = re.compile(
     r"(?:(?:ssn|social\s*security)\s*[:#-]?\s*)(\d{3})[-\s]?(\d{2})[-\s]?(\d{4})\b",
     re.IGNORECASE
@@ -322,22 +348,21 @@ ID_COL_HINT_RE = re.compile(
     re.IGNORECASE
 )
 
-# Excel column header hints for Name columns  used for standalone Person Name detection
+# Excel column header hints for name columns, used for standalone person name detection
 NAME_COL_HINT_RE = re.compile(
     r"(?<![A-Za-z])(?:employee[\s_]?name|emp[\s_]?name|full[\s_]?name|fullname"
     r"|first[\s_]?name|firstname|last[\s_]?name|lastname|name)(?![A-Za-z])",
     re.IGNORECASE
 )
 
-# Stricter regex  only matches FULL name columns (used to select the "best" name for pair detection)
-# Deliberately excludes first_name / last_name / firstname / lastname
+# Matches full name columns only (excludes first_name / last_name)
 FULL_NAME_COL_RE = re.compile(
     r"(?<![A-Za-z])(?:employee[\s_]?name|emp[\s_]?name|full[\s_]?name|fullname"
     r"|(?<!first[\s_])(?<!last[\s_])name)(?![A-Za-z])",
     re.IGNORECASE
 )
 
-# Hint for DOB-like columns (expand if needed)
+# Hint for DOB-like columns
 DOB_COL_HINT_RE = re.compile(
     r"\b(dob|date\s*of\s*birth|birth\s*date|birthdate)\b",
     re.IGNORECASE
@@ -348,7 +373,7 @@ BANK_ACCT_COL_HINT_RE = re.compile(
     re.IGNORECASE
 )
 
-# Hint for City columns
+# Hint for city columns
 CITY_COL_HINT_RE = re.compile(
     r"\b(city|town|location|district)\b",
     re.IGNORECASE
@@ -369,12 +394,17 @@ TYPE_PRIORITY = {
     "Name, email": 1,
     "Name, Date of Birth": 1,
     "Name, Company ID": 1,
+    "Name, Phone": 1,
+    "Name, Address": 1,
+    "Name, City": 1,
+    "Name, State": 1,
+    "Name, Gender": 1,
     "email": 2,
     "Date of Birth": 2,
     "SSN Number": 3,
     "Credit/Debit Card": 4,
     "US Passport Number": 5,
-    "Driving License": 6,              # we’ll map 'Driving License (ST)' to this base for priority compare
+    "Driving License": 6,  # 'Driving License (ST)' maps to this base for priority comparison
     "Company ID": 7,
     "Account Number": 8,
     "Phone": 9,
@@ -388,9 +418,9 @@ def _base_type(pi_type: str) -> str:
 
 def find_ssn_in_text(text: str) -> list[str]:
     out = []
-    # strict pattern (already in pi_PATTERNS): \b\d{3}-\d{2}-\d{4}\b
+    # strict pattern: \b\d{3}-\d{2}-\d{4}\b
     out.extend(re.findall(r"\b\d{3}-\d{2}-\d{4}\b", text))
-    # OCR-flexible when SSN keyword is nearby
+    # more flexible match when SSN keyword is nearby
     for m in SSN_NEARBY_FLEX_RE.finditer(text):
         out.append(f"{m.group(1)}-{m.group(2)}-{m.group(3)}")
     return list(dict.fromkeys(out))
@@ -408,11 +438,8 @@ def first_valid_dob_iso(text: str) -> str | None:
 
 def group_block_entities(block_text: str) -> dict[str, list[str]]:
     """
-    Return buckets with:
-      - 'name' (list of cleaned names)
-      - 'email', 'Date of Birth', 'Company ID'
-      - plus standalone buckets: 'SSN Number', 'US Passport Number', 'Driving License (ST)',
-        'Phone', 'Address', 'MRN', 'Insurance ID', 'Account Number', 'Credit/Debit Card'
+    Return entity buckets for names, emails, DOB, company IDs, and all other
+    standalone PII types (SSN, passport, driving license, phone, address, etc.).
     """
     data: dict[str, list[str]] = {}
     t = block_text or ""
@@ -420,13 +447,10 @@ def group_block_entities(block_text: str) -> dict[str, list[str]]:
         return data
 
     # Names
-    # In table rows, try to extract full names from pipe-separated columns
-    # extract_person_names already handles this, but for short pipe/tab-delimited
-    
+    # For pipe/tab-delimited table rows, try grabbing the first titlecase token cluster
+    # if spaCy missed it (e.g. "Luna White | …")
     names = extract_person_names(t, max_names=5)
 
-    # Extra: for pipe/tab-delimited table rows, try grabbing the first token cluster
-    # that matches "Titlecase Titlecase" if spaCy missed it (e.g. "Luna White | …")
     if not names:
         _tbl_name_re = re.compile(
             r"^([A-Z][a-z]{1,15}(?:\s+[A-Z][a-z]{1,15}){1,2})\s*(?:\||,|\t|$)"
@@ -441,7 +465,7 @@ def group_block_entities(block_text: str) -> dict[str, list[str]]:
     if names:
         data["name"] = names
 
-    # Generic regex types (except SSNhandled below)
+    # Generic regex types (except SSN, handled below)
     for pi_type, pattern in pi_PATTERNS.items():
         if pi_type.lower() == "ssn number":
             continue
@@ -459,7 +483,7 @@ def group_block_entities(block_text: str) -> dict[str, list[str]]:
     if ssns:
         data.setdefault("SSN Number", []).extend(ssns)
 
-    # DOB  try ALL patterns including year-first variants
+    # DOB — try all patterns including year-first variants
     dob_iso = first_valid_dob_iso(t)
     if dob_iso:
         data.setdefault("Date of Birth", []).append(dob_iso)
@@ -476,7 +500,7 @@ def group_block_entities(block_text: str) -> dict[str, list[str]]:
     for m in MRN_RE.finditer(t):
         data.setdefault("MRN", []).append(m.group(1) or m.group(2) or "")
     for m in INSURANCE_ID_RE.finditer(t):
-        data.setdefault("Insurance ID", []).append(m.group(1))
+        data.setdefault("Insurance ID", []).append(m.group(1) or m.group(2) or "")
 
     # Company ID (positive context + no negative context)
     for m in ALNUM_COMPANY_ID_RE.finditer(t):
@@ -488,8 +512,8 @@ def group_block_entities(block_text: str) -> dict[str, list[str]]:
         if is_company_id(token, context=t):
             data.setdefault("Company ID", []).append(token)
 
-    # Account Number  require banking context (keyword in surrounding text)
-    # Override: if "Account Number" was matched by regex but no context → drop it
+    # Account Number — only keep if banking keywords are present in context
+    # Override: if "Account Number" was matched by regex but no context, drop it
     if "Account Number" in data:
         if not _has_account_context(t):
             data.pop("Account Number", None)
@@ -505,28 +529,99 @@ def group_block_entities(block_text: str) -> dict[str, list[str]]:
             if not data["Account Number"]:
                 data.pop("Account Number", None)
 
-    # Address  street pattern + suite-lead pattern
+    # Address — street pattern + suite-lead pattern
     flat = re.sub(r"[\r\n\t]+", " ", t)
+    raw_addrs = []
     for m in re.findall(ADDRESS_PATTERN, flat, flags=re.IGNORECASE):
         v = m.strip()
         if v:
-            data.setdefault("Address", []).append(v)
+            raw_addrs.append(v)
     for m in ADDRESS_SUITE_PATTERN.finditer(flat):
         v = m.group(0).strip()
         if v and len(v) > 8:
-            data.setdefault("Address", []).append(v)
+            raw_addrs.append(v)
+    # Drop any address that's a substring of a longer detected one
+    raw_addrs_sorted = sorted(set(raw_addrs), key=len, reverse=True)
+    deduped_addrs = []
+    for addr in raw_addrs_sorted:
+        if not any(addr != longer and addr in longer for longer in deduped_addrs):
+            deduped_addrs.append(addr)
+    if deduped_addrs:
+        data["Address"] = deduped_addrs
 
-    # Luhn-valid account numbers are re-tagged as credit cards
+    # Luhn-valid account numbers get re-tagged as credit cards
     for v in list(data.get("Account Number", [])):
         if passes_luhn(v):
             data.setdefault("Credit/Debit Card", []).append(v)
             data["Account Number"].remove(v)
 
-    # Phone: filter to plausible format
+    # Phone — filter to plausible format
     if "Phone" in data:
         data["Phone"] = [p for p in data["Phone"] if is_plausible_phone(p)]
 
-    # De-dup per bucket
+    # Indian Phone — skip numbers already captured as account/routing (account wins when IFSC/bank context present)
+    if "Indian Phone" in data:
+        acct_digits = {re.sub(r"\D", "", v) for v in data.get("Account Number", [])}
+        acct_digits |= {re.sub(r"\D", "", v) for v in data.get("Routing Number", [])}
+        data["Indian Phone"] = [
+            v for v in data["Indian Phone"]
+            if re.sub(r"\D", "", v) not in acct_digits
+        ]
+        if not data["Indian Phone"]:
+            data.pop("Indian Phone", None)
+
+    # Gender
+    gender_vals = detect_gender_values(t)
+    if gender_vals:
+        data["Gender"] = gender_vals
+
+    # State — extract from text
+    state_raw = detect_states(t, unique_only=True)
+    if state_raw:
+        data["State"] = state_raw if isinstance(state_raw, list) else [state_raw]
+
+    # City — extract from addresses by looking for a city token before a state abbreviation/ZIP
+    _city_from_addr_re = re.compile(
+        r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}),\s*[A-Z]{2}(?:\s+\d{5,6})?\b"
+    )
+    _city_vals: List[str] = []
+    for _addr in data.get("Address", []):
+        for _m in _city_from_addr_re.finditer(_addr):
+            _city_candidate = _m.group(1).strip()
+            # Skip tokens that are known stop words (state names, common labels)
+            # note: Indian city names like Bengaluru are intentionally excluded
+            # because they are valid city values even if they appear in PERSON_STOP_TOKENS
+            _city_stop_tokens = {
+                "CALIFORNIA","TEXAS","FLORIDA","OHIO","GEORGIA","MICHIGAN","ILLINOIS",
+                "PENNSYLVANIA","ARIZONA","INDIANA","TENNESSEE","MISSOURI","MARYLAND",
+                "WISCONSIN","COLORADO","MINNESOTA","CAROLINA","VIRGINIA","NEVADA",
+                "LOUISIANA","KENTUCKY","CONNECTICUT","OREGON","OKLAHOMA","IOWA",
+                "MISSISSIPPI","ARKANSAS","UTAH","KANSAS","HAWAII","NEBRASKA","IDAHO",
+                "MAINE","HAMPSHIRE","RHODE","ISLAND","MONTANA","DELAWARE","WYOMING",
+                "ALASKA","VERMONT","DAKOTA","WASHINGTON",
+                "FIELD","VALUE","SECTION","DOCUMENT","SYNTHETIC","NOTE","DISCLAIMER",
+            }
+            if _city_candidate.upper() not in _city_stop_tokens:
+                _city_vals.append(_city_candidate)
+    # also scan raw text for City, ST ZIP patterns
+    for _m in _city_from_addr_re.finditer(t):
+        _city_candidate = _m.group(1).strip()
+        _city_stop_tokens = {
+            "CALIFORNIA","TEXAS","FLORIDA","OHIO","GEORGIA","MICHIGAN","ILLINOIS",
+            "PENNSYLVANIA","ARIZONA","INDIANA","TENNESSEE","MISSOURI","MARYLAND",
+            "WISCONSIN","COLORADO","MINNESOTA","CAROLINA","VIRGINIA","NEVADA",
+            "LOUISIANA","KENTUCKY","CONNECTICUT","OREGON","OKLAHOMA","IOWA",
+            "MISSISSIPPI","ARKANSAS","UTAH","KANSAS","HAWAII","NEBRASKA","IDAHO",
+            "MAINE","HAMPSHIRE","RHODE","ISLAND","MONTANA","DELAWARE","WYOMING",
+            "ALASKA","VERMONT","DAKOTA","WASHINGTON",
+            "FIELD","VALUE","SECTION","DOCUMENT","SYNTHETIC","NOTE","DISCLAIMER",
+        }
+        if _city_candidate.upper() not in _city_stop_tokens and _city_candidate not in _city_vals:
+            _city_vals.append(_city_candidate)
+    if _city_vals:
+        data["City"] = list(dict.fromkeys(_city_vals))  # deduped, order preserved
+
+    # Deduplicate per bucket
     for k, vals in list(data.items()):
         seen = set(); uniq = []
         for x in vals:
@@ -536,19 +631,13 @@ def group_block_entities(block_text: str) -> dict[str, list[str]]:
 
     return data
 
-# ---------- De-dup helpers ----------
+# Dedup helpers
 def _base_type(pi_type: str) -> str:
     """Normalize PI Type for de-dup purposes (e.g., all 'Driving License (ST)' → 'Driving License')."""
     return "Driving License" if pi_type.startswith("Driving License") else pi_type
 
 def _norm_value_for_key(base_type: str, value: str) -> str:
-    """
-    Normalize the detected value for stable dedupe keys:
-      - emails lowercased
-      - numbers stripped of punctuation/spaces
-      - dates left as-is (ideally ISO already)
-      - everything else collapsed spaces
-    """
+    """Normalize detected values for dedup keys: emails lowercased, numbers stripped of punctuation, dates as-is, everything else collapsed."""
     v = (value or "").strip()
     bt = base_type.lower()
     if bt == "email":
@@ -570,17 +659,15 @@ def _add_record(records: List[Dict[str, Any]],
                 pi_type: str,
                 value: str,
                 confidence: int) -> None:
-    """
-    Append a record only if we haven't added an equivalent one already.
-    De-dupes by (File, BasePage, BaseType, NormalizedValue) where BasePage
-    strips the "(Table N)" suffix so the same value on a page body and its
-    table don't both get emitted.
-    """
     base = _base_type(pi_type)
     norm_val = _norm_value_for_key(base, value)
-    # Normalise page label for dedup
-    base_page = re.sub(r"\s*\(Table\s+\d+\)\s*$", "", page_sheet, flags=re.IGNORECASE).strip()
-    key = (file_name, base_page, base, norm_val)
+    # Pair types: dedup globally so the same pair isn't repeated from multiple window positions
+    if pi_type.startswith("Name,"):
+        key = (file_name, base, norm_val)
+    else:
+        # Standalone PII: include page so the same value on different pages both shows up
+        base_page = re.sub(r"\s*\(Table\s+\d+\)\s*$", "", page_sheet, flags=re.IGNORECASE).strip()
+        key = (file_name, base_page, base, norm_val)
     if key in seen:
         return
     seen.add(key)
@@ -594,15 +681,12 @@ def _add_record(records: List[Dict[str, Any]],
     })
 
 def _find_best_name_for_target(names: list[str], block_text: str, target_value: str) -> str | None:
-    """
-    Pick the name that is closest to the target occurrence in block_text,
-    preferring names that occur BEFORE the target.
-    """
+    """Pick the name closest to the target in block_text, preferring names that appear before it."""
     if not names or not target_value:
         return names[0] if names else None
 
     t = block_text or ""
-    # Find target index (first occurrence)
+
     try:
         tgt_idx = t.index(target_value)
     except ValueError:
@@ -616,12 +700,12 @@ def _find_best_name_for_target(names: list[str], block_text: str, target_value: 
             # if not found verbatim (OCR quirks), fall back to distance from start
             n_idx = 0
 
-        # Prefer names BEFORE the target (penalty 0), then after (penalty 1)
+        # Names before the target get penalty 0, names after get penalty 1
         penalty = 0 if (tgt_idx >= 0 and n_idx <= tgt_idx) else 1
         dist = abs((tgt_idx if tgt_idx >= 0 else 0) - n_idx)
         scored.append((penalty, dist, n))
 
-    # sort by (penalty, then distance); return best
+    # sort by penalty then distance
     scored.sort(key=lambda x: (x[0], x[1]))
     return scored[0][2] if scored else (names[0] if names else None)
 
@@ -630,11 +714,7 @@ def emit_grouped_records(file_name: str,
                          cell: str,
                          block_text: str,
                          pair_only: bool = False) -> list[dict]:
-    """
-    Pair ONLY: (Name + email), (Name + Date of Birth), (Name + Company ID) using proximity within this block.
-    - pick the nearest PRECEDING name to each target value (when possible)
-    - if no names, return [] in pair_only mode
-    """
+    """Emit name-paired records (Name+email, Name+DOB, Name+CompanyID etc.) using proximity within the block."""
     results: list[dict] = []
     bucket = group_block_entities(block_text)
     names = bucket.pop("name", [])
@@ -653,7 +733,7 @@ def emit_grouped_records(file_name: str,
                 "Confidence (%)": 95,
             })
 
-    # ---- Pair DOB (ISO in your pipeline)
+    # Pair DOB
     for dob in bucket.get("Date of Birth", []):
         best = _find_best_name_for_target(names, block_text, dob)
         if best:
@@ -666,7 +746,7 @@ def emit_grouped_records(file_name: str,
                 "Confidence (%)": 95,
             })
 
-    ## ---- Pair Company ID (already context-gated in group_block_entities via
+    # Pair Company ID
     for cid in bucket.get("Company ID", []):
         best = _find_best_name_for_target(names, block_text, cid)
         if best:
@@ -679,12 +759,100 @@ def emit_grouped_records(file_name: str,
                 "Confidence (%)": 95,
             })
 
-    # pair_only=True: we do not emit any standalone PII here
+    for phone in bucket.get("Phone", []):
+        best = _find_best_name_for_target(names, block_text, phone)
+        if best:
+            results.append({
+                "File": file_name,
+                "Page/Sheet": page_or_sheet,
+                "Cell": cell,
+                "PI Type": "Name, Phone",
+                "Detected Value": f"{best}, {phone}",
+                "Confidence (%)": 90,
+            })
+
+    for phone in bucket.get("Indian Phone", []):
+        best = _find_best_name_for_target(names, block_text, phone)
+        if best:
+            results.append({
+                "File": file_name,
+                "Page/Sheet": page_or_sheet,
+                "Cell": cell,
+                "PI Type": "Name, Phone",
+                "Detected Value": f"{best}, {phone}",
+                "Confidence (%)": 90,
+            })
+
+    for addr in bucket.get("Address", []):
+        best = _find_best_name_for_target(names, block_text, addr)
+        if best:
+            results.append({
+                "File": file_name,
+                "Page/Sheet": page_or_sheet,
+                "Cell": cell,
+                "PI Type": "Name, Address",
+                "Detected Value": f"{best}, {addr}",
+                "Confidence (%)": 88,
+            })
+
+    # City pairs
+    for city in bucket.get("City", []):
+        best = _find_best_name_for_target(names, block_text, city)
+        if best:
+            results.append({
+                "File": file_name,
+                "Page/Sheet": page_or_sheet,
+                "Cell": cell,
+                "PI Type": "Name, City",
+                "Detected Value": f"{best}, {city}",
+                "Confidence (%)": 85,
+            })
+
+    # Normalize states — convert full names to postal codes to avoid NY + New York duplicates
+    _state_list = bucket.get("State", [])
+    _seen_state_codes: set = set()
+    _normalized_states: list = []
+    for s in _state_list:
+        # Convert full state name to postal code if possible
+        _code = US_STATES.get(s) or US_STATES.get(s.title()) or s
+        # Also check if s is already a 2-letter code in the values dict
+        if len(s) > 2:  # full name like "New York"
+            _code = US_STATES.get(s, s)
+        else:
+            _code = s  # already a postal code
+        if _code not in _seen_state_codes:
+            _seen_state_codes.add(_code)
+            _normalized_states.append(_code)
+
+    for state in _normalized_states:
+        best = _find_best_name_for_target(names, block_text, state)
+        if best:
+            results.append({
+                "File": file_name,
+                "Page/Sheet": page_or_sheet,
+                "Cell": cell,
+                "PI Type": "Name, State",
+                "Detected Value": f"{best}, {state}",
+                "Confidence (%)": 80,
+            })
+
+    for gender in bucket.get("Gender", []):
+        best = _find_best_name_for_target(names, block_text, gender)
+        if best:
+            results.append({
+                "File": file_name,
+                "Page/Sheet": page_or_sheet,
+                "Cell": cell,
+                "PI Type": "Name, Gender",
+                "Detected Value": f"{best}, {gender}",
+                "Confidence (%)": 85,
+            })
+
     return results
 
 def passes_luhn(s: str) -> bool:
     digits = re.sub(r"\D", "", s)
-    if len(digits) < 12:  # typical cards 13–19, we check ≥12 to be safe with OCR
+    if len(digits) < 12:  # cards are typically 13-19 digits; 12 is a safe OCR floor
         return False
     total = 0
     rev = digits[::-1]
@@ -699,21 +867,23 @@ def passes_luhn(s: str) -> bool:
 
 def is_plausible_phone(s: str) -> bool:
     digits = re.sub(r"\D", "", s)
-    ## Require at least 10 digits AND at least one phone-like symbol/space; reject
+    # Require at least 10 digits and at least one phone-like symbol/space
     return len(digits) >= 10 and re.search(r"[()\-\+\s]", s) is not None
 
 DL_CONTEXT_RE = re.compile(
-    r"\b(driver'?s?|driving)\b|\blic(?:\.|ense)?\b|\bdl\b|\bd[.\s]?/?\s*l\.?\b",
+    r"\b(driver'?s?|driving)\b|\blic(?:\.|ense)?\b|\bdl\b|\bd[.\s]?/?[\s]*l\.?\b"
+    r"|driver(?:s)?licen[cs]e"   # compound: DriverLicense, DriversLicense
+    r"|driving[\s_]?licen[cs]e", # compound: DrivingLicense
     re.IGNORECASE
 )
 
 def has_dl_context(text: str, col_name: str | None = None) -> bool:
-    """True only if DL-like keywords appear in the text or header (NOT just generic 'ID')."""
+    """True if DL-like keywords appear in the text or column header."""
     def _hit(s: str | None) -> bool:
         return bool(s and DL_CONTEXT_RE.search(s))
     return _hit(text) or _hit(str(col_name) if col_name is not None else None)
 
-# ---- safe string conversion everywhere we scan text ----
+# Safe string conversion for cell values
 def _to_text(val: Any) -> str:
     try:
         if pd.isna(val):
@@ -723,7 +893,7 @@ def _to_text(val: Any) -> str:
     return str(val).strip() if val is not None else ""
 
 def _dl_core_len_ok(state: str, core: str) -> bool:
-    """Validate DL core length using min/max tables after stripping non-alnum and accidental state prefix."""
+    """Validate DL core length using min/max tables."""
     normalized_core = re.sub(r"[^A-Za-z0-9]", "", core or "")
     normalized_core = re.sub(rf"^{state}", "", normalized_core, flags=re.IGNORECASE)
     min_len = US_DL_MIN_LENGTH.get(state, 1)
@@ -731,46 +901,46 @@ def _dl_core_len_ok(state: str, core: str) -> bool:
     return min_len <= len(normalized_core) <= max_len
 
 def iter_dl_matches(text: str, col_name: str | None = None, require_context: bool = True):
-    """
-    Yield (state, full_value, core) for DL candidates in text.
-    If require_context=True, only yield when DL keywords appear in text/col header.
-    Deduplicates: longest match wins for overlapping spans.
-    Guards:
-    - A state-prefixed DL (TX-A12345678) suppresses bare-core matches for OTHER states.
-    - Values adjacent to "Passport" keyword are not emitted as DL.
-    """
+    """Yield (state, full_value, core) for DL candidates. Longest match wins for overlapping spans. Values adjacent to a passport keyword are skipped."""
     if not text:
         return
     if require_context and not has_dl_context(text, col_name):
         return
 
-    # Pre-collect passport-keyword spans so we can suppress DL matches next to them
+    # Pre-collect passport keyword spans to suppress DL matches that sit next to them
     _PASSPORT_KW_RE = re.compile(r"\bpassport\b", re.IGNORECASE)
     passport_spans = [(m.start(), m.end()) for m in _PASSPORT_KW_RE.finditer(text)]
 
+    # Check if col_name is explicitly a DL/license column
+    _col_str = str(col_name).lower() if col_name else ""
+    _is_dl_col = bool(re.search(r'\b(?:driver|driving|license|licence|dl)\b', _col_str))
+
     def _near_passport(start: int, end: int, value: str) -> bool:
-        """True if this specific value appears immediately after a passport keyword
-        (within 15 chars), meaning it IS the passport number, not a DL nearby."""
+        """True if the value sits immediately after a passport keyword (within 15 chars)."""
         for ps, pe in passport_spans:
             # Only suppress if the match starts right after the passport keyword
             if 0 <= (start - pe) <= 15:
                 return True
         return False
 
-    # Collect all raw matches first, then deduplicate by span
+    # Collect all raw matches, then deduplicate by span
     all_matches = []  # (start, end, state, full_value, core)
     for state, pattern in US_DL_PATTERNS.items():
+        # Pure-digit DL states are too ambiguous — only emit when
+        # an explicit DL/driver/license column header is present
+        if state in _PURE_DIGIT_DL_STATES and not _is_dl_col:
+            continue
         for m in re.finditer(pattern, text, flags=re.IGNORECASE):
             full_value = m.group(0)
             core = (m.groupdict().get("core") if hasattr(m, "groupdict") else None) or full_value
             if not _dl_core_len_ok(state, core):
                 continue
-            ## Skip if this value sits immediately after a "Passport" keyword (it IS the
+            # skip if this value sits immediately after a passport keyword
             if _near_passport(m.start(), m.end(), full_value):
                 continue
             all_matches.append((m.start(), m.end(), state, full_value, core))
 
-    # Sort by length descending (longest / most-specific match wins)
+    # Sort by length descending — longest/most-specific match wins
     all_matches.sort(key=lambda x: -(x[1] - x[0]))
 
     emitted_spans: list[tuple[int, int]] = []
@@ -781,11 +951,10 @@ def iter_dl_matches(text: str, col_name: str | None = None, require_context: boo
         emitted_spans.append((start, end))
         yield state, full_value, core
 
-# --- Fallback PERSON name detector if spaCy model isn't available ---
-# --- Person blacklist & DL label filters ---
+# Fallback person name detector (used when spaCy isn't available) and blacklist filters
 PERSON_HEUR_RE = re.compile(r"\b([A-Z][a-z]+(?:[ \t]+[A-Z][a-z]+){1,2})(?=[ \t]*(?:[,;:\.\-\u2013\u2014(]|\s|$))")
 
-# Tokens often printed on licenses/IDs that should NEVER be treated as names
+# Tokens printed on licenses/IDs that should never be treated as names
 STOP_TOKENS = {
     # Document/label tokens
     "DRIVER", "DRIVERS", "DRIVING", "LICENSE", "ID", "DL", "NUMBER", "NO", "NUM",
@@ -794,19 +963,19 @@ STOP_TOKENS = {
     "DONOR", "ORGAN", "EYE", "HAIR", "HEIGHT", "HGT", "WEIGHT", "WGT", "SIGN", "SIGNATURE",
     # Dates/metadata
     "DOB", "BIRTH", "DATE", "ISS", "ISSUE", "ISSUED", "EXP", "EXPIRES", "EXPIRY",
-    # OCR junk/common test words
+    # OCR noise and test data words
     "TEST", "DATA", "TEST DATA", "SAMPLE", "SPECIMEN", "BARCODE",
-    # Section/document header words that spaCy/heuristic tags as PERSON
+    # Section/document header words sometimes mistagged as PERSON
     "SCENARIO", "ONBOARDING", "PAYMENT", "DISPUTE", "MEDICAL", "PRE", "AUTHORIZATION",
     "WIRE", "TRANSFER", "REQUEST", "REQUESTER", "CORPORATE", "SYNTHETIC", "EMBEDDED",
     "DEAR", "WRITING", "CONFIRM", "START", "SESSION", "TRANSACTION", "UNAUTHORIZED",
     "EMERGENCY", "VERIFICATION", "ORIGINATED",
-    # Direction/role prefixes that get merged with names
+    # Direction/role prefixes that sometimes get merged with names
     "FROM", "TO", "SENDER", "RECEIVER", "RECIPIENT", "SUBJECT", "RE",
     # Section titles
     "FRAUD", "INVESTIGATION", "LOAN", "APPLICATION", "ADDITIONAL", "RECORDS",
     "BACKGROUND", "CHECK", "EMPLOYEE", "HEALTHCARE", "FINANCE", "GLOBAL",
-    # Column/category labels that trail names in Excel/table cells
+    # Column/category labels that can trail names in Excel cells
     "IDENTITY", "CATEGORY", "PROOF", "TYPE", "SOURCE", "STATUS", "LABEL",
     "FIELD", "VALUE", "RECORD", "ENTRY", "ITEM", "FORMAT", "DETAIL",
     "DESCRIPTION", "REMARK", "COMMENT", "VERSION", "REVISION",
@@ -814,6 +983,9 @@ STOP_TOKENS = {
     "SUMMARY", "OVERVIEW", "HEADER", "COLUMN", "ROW",
     "SCANNED", "DOCUMENT", "IMAGE", "STRUCTURED", "SELECTABLE",
     "TYPED", "DUMMY", "COMPARISON", "DRAFT", "REVIEW", "PREVIEW",
+    # Words that trail names in free text (| Gender: Male | Company ID:)
+    "GENDER", "FEMALE", "MALE", "COMPANY", "EMPLOYEE", "STAFF", "BADGE", "PAYROLL",
+    "PII", "FULL", "SET", "TEST", "COMPREHENSIVE", "COMPLETE",
     # Medical/healthcare words often misdetected as names
     "ADMISSION", "DISCHARGE", "PATIENT", "DIAGNOSIS", "TREATMENT", "PROCEDURE",
     "REFERRAL", "PRESCRIPTION", "ATTENDING", "RESIDENT", "PHYSICIAN", "NURSING",
@@ -823,7 +995,7 @@ STOP_TOKENS = {
     "INTEREST", "BALANCE", "LEDGER", "BENEFICIARY",
 }
 
-# Phrases that appear verbatim on IDs
+# Common verbatim phrases that appear on IDs
 STOP_PHRASES = {
     "DRIVER LICENSE", "DRIVER'S LICENSE", "DATE OF BIRTH", "TEST DATA", "DRIVING LICENSE",
     "WIRE TRANSFER", "WIRE TRANSFER REQUEST", "MEDICAL PRE", "MEDICAL PRE-AUTHORIZATION",
@@ -832,16 +1004,15 @@ STOP_PHRASES = {
     "EMPLOYEE BACKGROUND", "EMPLOYEE BACKGROUND CHECK",
 }
 
-# ---------- Name extraction & cleaning (strict) ----------
-# ---------- Strict name extraction & cleaning ----------
+# Name extraction and cleaning
 
-# Tokens/headers/cities that must NOT be treated as names (extend as needed)
+# Tokens, headers, and cities that should never be treated as names
 PERSON_STOP_TOKENS = {
     "HELLO","HI","INTAKE","EMAIL","SUPPORT","TICKET","PAYMENT","BANK","ACCOUNT","UPDATE","VOTER","APPLICANT","POLICYHOLDER","CLAIMANT","INSURED","NOMINEE","CUSTOMER","CLIENT","AADHAAR","AADHAR","PAN","IFSC","UID","UIN",
     "ROUTING","SCENARIO","TRAVEL","ITINERARY","NOTE","DISCLAIMER","CONTACT","TABLE","EMBEDDED",
     # Section / document header words that appear as labels in test documents
     "FIELD","VALUE","SECTION","SELECTABLE","TYPED","STRUCTURED","SCANNED","DOCUMENT","IMAGE","FREE","FORM","BLOCK","COMPARISON","OCR","SPREADSHEET","DUMMY","SYNTHETIC",
-    # US cities (individual tokens  multi-word cities handled by _is_us_city_fragment below)
+    # US city tokens (multi-word cities handled by _is_us_city_fragment)
     "MIAMI","SEATTLE","RALEIGH","ATLANTA","SAN","FRANCISCO","DALLAS","DENVER","DETROIT",
     "ANGELES","CHICAGO","HOUSTON","PHOENIX","PHILADELPHIA","ANTONIO","DIEGO","JOSE",
     "AUSTIN","JACKSONVILLE","COLUMBUS","CHARLOTTE","INDIANAPOLIS","PORTLAND","MEMPHIS",
@@ -857,26 +1028,26 @@ PERSON_STOP_TOKENS = {
     "LITTLE","ROCK","COLUMBIA","AUGUSTA","GRAND","RAPIDS","SALT","LAKE","CITY",
     "TALLAHASSEE","HUNTSVILLE","WORCESTER","KNOXVILLE","PROVIDENCE","BROWNSVILLE",
     "SANTA","ANA","BUFFALO","FORT","WORTH","EL","PASO","NEW","YORK","LOS","WASHINGTON",
-    # US state names (full words that could be misdetected)
+    # US state names (can be misdetected as person names)
     "CALIFORNIA","TEXAS","FLORIDA","OHIO","GEORGIA","MICHIGAN","ILLINOIS","PENNSYLVANIA",
     "ARIZONA","INDIANA","TENNESSEE","MISSOURI","MARYLAND","WISCONSIN","COLORADO",
     "MINNESOTA","CAROLINA","VIRGINIA","NEVADA","LOUISIANA","KENTUCKY","CONNECTICUT",
     "OREGON","OKLAHOMA","IOWA","MISSISSIPPI","ARKANSAS","UTAH","KANSAS","NEVADA",
     "HAWAII","NEBRASKA","IDAHO","MAINE","HAMPSHIRE","RHODE","ISLAND","MONTANA",
     "DELAWARE","WYOMING","ALASKA","VERMONT","DAKOTA",
-    # Indian location words that spaCy tags as PERSON
+    # Indian location words often mistagged as PERSON
     "NAGAR","SALAI","COLONY","HILLS","LINES","LAKE","LAYOUT","EXTENSION","VIHAR","ENCLAVE",
     "SECTOR","BLOCK","PHASE","CROSS","MAIN","CHOWK","MARG",
-    # Indian cities commonly misdetected
+    # Indian cities commonly misdetected as names
     "MUMBAI","DELHI","BENGALURU","BANGALORE","CHENNAI","HYDERABAD","PUNE","KOLKATA",
     "AHMEDABAD","JAIPUR","LUCKNOW","SURAT","BHOPAL","NAGPUR","PATNA","INDORE",
-    # Common standalone location prefixes
+    # Location prefixes
     "CIVIL","JUBILEE","LAJPAT","NEHRU","ANNA","BRIGADE","MARINE","PARK","MG",
-    # Email domain words that spaCy extracts as names
+    # Email domain words sometimes extracted as names
     "EXAMPLE","GMAIL","YAHOO","HOTMAIL","OUTLOOK",
 }
 
-# Multi-word US city/place fragments that spaCy tags as PERSON
+# Multi-word US city fragments that spaCy sometimes tags as PERSON
 _US_CITY_FRAGMENTS = {
     "LOS ANGELES", "NEW YORK", "SAN FRANCISCO", "SAN DIEGO", "SAN JOSE", "SAN ANTONIO",
     "NEW ORLEANS", "LAS VEGAS", "EL PASO", "FORT WORTH", "COLORADO SPRINGS",
@@ -889,14 +1060,14 @@ def _is_us_city_fragment(name: str) -> bool:
     """Return True if the candidate name matches a known US city (multi-word)."""
     return name.upper() in _US_CITY_FRAGMENTS
 
-# Contextual name patterns  lookahead stops at punctuation/paren/period
+# Contextual name patterns — lookahead stops at punctuation/parens/period
 _CTX_NAME_PATTERNS = [
     re.compile(r"\bmy\s+name\s+is\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})(?=\s*(?:[,;:\.\-\u2013\u2014(]|$))", re.IGNORECASE),
     re.compile(r"\bpatient(?:\s*:)?\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})(?=\s*(?:[,;:\.\-\u2013\u2014(]|$))",   re.IGNORECASE),
     re.compile(r"\btraveler(?:\s*:)?\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})(?=\s*(?:[,;:\.\-\u2013\u2014(]|$))",  re.IGNORECASE),
     re.compile(r"\b(?:applicant|voter|policy\s*holder|employee)(?:[:\s]+)([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})(?=\s*(?:[,;\.\s]|$))", re.IGNORECASE),
     re.compile(r"\b(?:customer|requester|requestor)(?:\s*:)?\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})(?=\s*(?:[,;\.\-]|$))", re.IGNORECASE),
-    # Direction/role prefixes  stop at comma, pipe, | (table separator), period
+    # Direction/role prefixes — stop at comma, pipe, or period
     re.compile(r"\b(?:from|sender)(?:\s*:)?\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})(?=\s*(?:[,;\.\|\-]|$))", re.IGNORECASE),
     re.compile(r"\b(?:to|receiver|recipient)(?:\s*:)?\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})(?=\s*(?:[,;\.\|\-]|$))", re.IGNORECASE),
     re.compile(r"\bsubject(?:\s*:)?\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})(?=\s*(?:[,;\.\|\-]|$))", re.IGNORECASE),
@@ -904,7 +1075,7 @@ _CTX_NAME_PATTERNS = [
 ]
 
 
-# Strip label prefixes at the start; allow optional colon
+# Strips label prefixes at the start (e.g. 'Patient:', 'Name:')
 NAME_PREFIX_RE  = re.compile(
     r"^(?:patient|traveler|name|voter|applicant|policy\s*holder|requester|requestor|"
     r"employee|contact|claimant|insured|beneficiary|nominee|customer|client|"
@@ -913,10 +1084,10 @@ NAME_PREFIX_RE  = re.compile(
     re.IGNORECASE
 )
 
-# Remove trailing parentheticals
+# Remove trailing parenthetical chunks
 NAME_PAREN_TRAILER_RE = re.compile(r"\s*\([^)]*\)\s*$")
 
-# Remove any trailers that start with MRN/DOB/SSN/DL/PASSPORT/etc.
+# Remove trailers starting with MRN/DOB/SSN/DL/Passport etc.
 NAME_BAD_TRAILERS_RE = re.compile(
     r"(?:[,;:\-\u2013\u2014]\s*)?(?:"
     r"mrn|medical\s*record|dob|d\.o\.b\.|date\s*of\s*birth|ssn|social\s*security|dl|driver'?s?\s*license|passport"
@@ -924,14 +1095,14 @@ NAME_BAD_TRAILERS_RE = re.compile(
     re.IGNORECASE
 )
 
-# If a name still ends with a label token, drop the tailing token
+# Drop any trailing label token from a name
 NAME_BAD_TAIL_TOKEN_RE = re.compile(
     r"\b(?:mrn|dob|ssn|dl|passport|policy|account|routing|"
     r"aadhaar|aadhar|pan|ifsc|voter|id|uid|uin|gstin|cin)\.?$",
     re.IGNORECASE
 )
 
-# Reject name if any of these tokens appear
+# Reject the name if any of these tokens appear
 NAME_REJECT_TOKEN_RE = re.compile(
     r"\b(?:mrn|medical\s*record|dob|d\.o\.b\.|date\s*of\s*birth|ssn|social\s*security|"
     r"dl|driver\'?s?\s*license|passport|aadhaar|aadhar|pan\s*card|ifsc|voter\s*id|"
@@ -968,22 +1139,18 @@ def _clean_name(n: str) -> str:
     return n
 
 def extract_person_names(text: str, max_names: int = 20) -> list[str]:
-    """
-    Prefer contextual names; then spaCy PERSON; then heuristic.
-    Clean label prefixes/parentheses/trailers and reject address fragments, cities/headers, and anything with digits.
-    """
+    """Prefer contextual names, then spaCy PERSON entities, then heuristic. Cleans label prefixes/trailers and rejects address fragments, cities, and anything with digits."""
     if not text or not text.strip():
         return []
     normalized = re.sub(r"[^A-Za-z0-9' \-\n]", " ", text)
 
     candidates: list[str] = []
 
-    # 1) contextual  run on raw text (preserves colon/pipe for label patterns)
-    #    AND normalized text (standard patterns)
-    candidates.extend(_ctx_names(text))        
-    candidates.extend(_ctx_names(normalized))  # normalized: fallback
+    # contextual — run on both raw and normalized text
+    candidates.extend(_ctx_names(text))
+    candidates.extend(_ctx_names(normalized))
 
-    # 2) spaCy PERSON
+    # spaCy PERSON entities
     nlp = get_nlp()
     if nlp is not None:
         try:
@@ -992,7 +1159,7 @@ def extract_person_names(text: str, max_names: int = 20) -> list[str]:
         except Exception:
             pass
 
-    # 3) heuristic fallback
+    # heuristic fallback
     candidates.extend(detect_person_names_simple(normalized))
 
     # Clean + filter + de-dup
@@ -1002,12 +1169,12 @@ def extract_person_names(text: str, max_names: int = 20) -> list[str]:
         n = _clean_name(raw)
         if not n or len(n) < 3:
             continue
-        if re.search(r"\d", n):               # any digit → not a name
+        if re.search(r"\d", n):               # any digit means it's not a name
             continue
         # Only accept uppercase-starting single words
         if len(n.split()) == 1 and not n[0].isupper():
             continue
-        ## In free text (not Excel column), require 2+ word names to avoid
+        # in free text, single words are not reliable names without context
         # Single words are not reliable names without context
         if _is_bad_label(n):                  # your label filter (e.g., SEX/CLASS/TEST)
             continue
@@ -1021,7 +1188,7 @@ def extract_person_names(text: str, max_names: int = 20) -> list[str]:
         if _is_us_city_fragment(n):
             continue
 
-        ## NEW: reject address-like fragments (Rd, Suite, Ave...) or things in an
+        # reject address-like fragments or things in an address zone
         if _looks_like_address_fragment(n, normalized):
             continue
 
@@ -1038,8 +1205,16 @@ PERSON_BLACKLIST = {
     "All","Insurance","Registration","Scenario","Policy","Voter","Applicant","Disclaimer","Note","Card","Phone","Aadhaar","Pan","Ifsc","Email","Mobile","Address","Bank","Account",
     "Synthetic","Fabricated","Testing","Verification","Update","Review","Contact","Embedded",
     "Following","Flagged","Reserved","Purposes","Functional","Non","Please","Hello",
-    # Section/label words seen in test documents
     "Field","Value","Section","Selectable","Typed","Structured","Scanned","Document","Image","Free","Form","Block","Comparison","Ocr","Spreadsheet","Dummy",
+    # Credit card brands
+    "Visa","Mastercard","Amex","Discover","Maestro","Rupay","Diners",
+    # Gender words
+    "Male","Female","Gender","Transgender","Binary",
+    # Document title words
+    "Pii","Full","Set","Comprehensive","Complete","Test","Sample",
+    # Other common FPs from Excel column values
+    "Fake","Data","Only","Record","Entry","Info","Information",
+    "Medical","Financial","Corporate","Global","Healthcare","India","Indian",
 }
 
 def _is_bad_label(name: str) -> bool:
@@ -1152,7 +1327,7 @@ def _looks_like_address_fragment(name: str, ctx: str) -> bool:
             return True
     return False
 
-# -------------------------- US States --------------------------
+# US States
 US_STATES = {
     "Alabama": "AL", "Alaska": "AK", "Arizona": "AZ", "Arkansas": "AR",
     "California": "CA", "Colorado": "CO", "Connecticut": "CT", "Delaware": "DE",
@@ -1171,7 +1346,7 @@ US_STATES = {
 STATE_NAME_RE = re.compile(r"\b(" + "|".join(re.escape(n) for n in US_STATES.keys()) + r")\b", re.IGNORECASE)
 STATE_POSTAL_RE = re.compile(r"(?<![A-Za-z])(?<!\w)(" + "|".join(US_STATES.values()) + r")(?![A-Za-z])")
 
-## when detected via postal code matching (to avoid "Gov ID" → Idaho, "Voter
+# skip high-ambiguity postal codes unless in address context
 _AMBIGUOUS_STATE_CODES = {"ID", "IN", "OR", "OK", "ME", "OH", "AR", "CO", "DE", "HI", "IA", "KS", "KY", "LA", "MA", "MD", "MI", "MN", "MO", "MS", "MT", "NC", "ND", "NE", "NH", "NJ", "NM", "NV", "NY", "OR", "PA", "RI", "SC", "SD", "UT", "VA", "VT", "WA", "WI", "WV", "WY"}
 _HIGH_AMBIGUITY_CODES = {"ID"}
 
@@ -1188,10 +1363,9 @@ def detect_states(text: str, unique_only: bool = False) -> List[str] | str:
         results.append(next(name for name in US_STATES if name.lower() == m.group(0).lower()))
     for m in STATE_POSTAL_RE.finditer(text):
         code = m.group(0)
-        ## Skip high-ambiguity two-letter codes unless they look like a state in an
-        # Address context: "City, ST ZIPCODE" or "City, ST" pattern
+        # skip high-ambiguity codes unless they look like a state in an address context
         if code in _HIGH_AMBIGUITY_CODES:
-            # Skip if this code looks like an address component
+            # only accept in address context
             start = m.start()
             window_before = text[max(0, start - 3):start]
             window_after = text[m.end():m.end() + 8]
@@ -1199,35 +1373,44 @@ def detect_states(text: str, unique_only: bool = False) -> List[str] | str:
                 re.search(r",\s*$", window_before) and re.search(r"^\s*\d{5,6}", window_after)
             )
             if not in_address_ctx:
-                continue  # skip — looks like label usage ("Gov ID", "Voter ID", etc.)
+                continue  # looks like a label, not a state
         results.append(code)
     unique_results = list(dict.fromkeys(results))
+    # Normalize to postal codes and dedup to prevent returning both 'New York' and 'NY'
+    _postal_seen: set = set()
+    _normalized: list = []
+    for r in unique_results:
+        # If r is a full name, convert to postal code
+        code = US_STATES.get(r) or US_STATES.get(r.title()) or r
+        if code not in _postal_seen:
+            _postal_seen.add(code)
+            _normalized.append(code)
+    unique_results = _normalized
     return unique_results if unique_only else ", ".join(unique_results)
 
 def detect_gender_values(text: str) -> List[str]:
-    """Return normalized gender mentions. Uses word-boundary regex to avoid
-    substring FPs like 'transaction'/'transfer' triggering 'transgender'."""
+    """Return normalized gender mentions. Uses word boundaries to avoid false matches inside words like 'transaction'."""
     if not text:
         return []
     found = set()
     if re.search(r"\bfemale\b", text, re.IGNORECASE):
         found.add("female")
-    # 'male' only if 'female' not already present (female contains 'male')
-    elif re.search(r"\bmale\b", text, re.IGNORECASE):
+    # Use a negative lookbehind so 'male' doesn't match inside 'female'
+    if re.search(r"(?<![A-Za-z])(?<!fe)male\b", text, re.IGNORECASE):
         found.add("male")
     if re.search(r"\bnon[\s\-]?binary\b", text, re.IGNORECASE):
         found.add("non-binary")
-    # 'transgender' as a whole word; bare 'trans' only as standalone word
+    # 'transgender' as a whole word; bare 'trans' only as a standalone token
     if re.search(r"\btransgender\b", text, re.IGNORECASE):
         found.add("transgender")
     elif re.search(r"\btrans\b", text, re.IGNORECASE):
-        # Extra guard: don't fire if 'trans' is a prefix of a non-gender word in context
+        # don't fire if 'trans' is a prefix of a non-gender word
         if not re.search(r"\btrans(?:action|fer|mit|port|form|lat|plant|parent)", text, re.IGNORECASE):
             found.add("transgender")
-    # M/F code
+    # M/F shorthand
     if re.search(r"\bm\s*[/\-]\s*f\b", text, re.IGNORECASE):
         found.add("m/f")
-    # Labeled single letters  only when gender/sex keyword present
+    # Single letter M/F only when a gender/sex keyword is present
     if re.search(r"\b(?:gender|sex)\s*[:\-]?\s*m\b", text, re.IGNORECASE):
         found.add("male")
     if re.search(r"\b(?:gender|sex)\s*[:\-]?\s*f\b", text, re.IGNORECASE):
@@ -1235,15 +1418,9 @@ def detect_gender_values(text: str) -> List[str]:
     return list(found)
 
 def get_confidence(pi_type: str, match_text: str, text_context: str) -> int:
-    """
-    Return 0-100 confidence. Scores below 40 are dropped by clean_pi_data.
-    Key rules:
-    - Structured types (SSN, email, PAN, Aadhaar) always high confidence.
-    - Account Number requires banking keyword context — drops to 15 without it.
-    - US Passport as bare 9 digits with no keyword drops to 45 (below cutoff).
-    """
+    """Return 0-100 confidence. Below 40 is dropped by clean_pi_data. Account Numbers without banking context score 15; bare 9-digit passports score 45."""
     ctx = text_context or ""
-    # Always reliable
+    # Always high confidence
     if pi_type in ("email", "SSN Number"):
         return 100
     if pi_type == "PAN Card":
@@ -1262,21 +1439,19 @@ def get_confidence(pi_type: str, match_text: str, text_context: str) -> int:
         return 88
     if pi_type == "Voter ID":
         return 88 if _VOTER_ID_CTX_RE.search(ctx) else 72
-    # Account Number  MUST have banking keyword or gets dropped
+    # Account Number — must have a banking keyword or it gets dropped
     if pi_type == "Account Number":
         if not _has_account_context(ctx):
             return 15   
         return 90 if len(re.sub(r"\D","",match_text)) >= 12 else 80
-    # Passport  letter+8digits is strong; bare 9 digits needs keyword
+    # Passport — letter+8digits is strong; bare 9 digits needs a keyword nearby
     if pi_type == "US Passport Number":
         if PASSPORT_KEYWORD.search(ctx):
             return 95
         if re.match(r"^[A-Z]\d{8}$", match_text.strip()):
-            # Letter+8digits without passport keyword gets low confidence
+            # letter+8digits without a passport keyword gets low confidence
             return 30  
         return 45   # bare 9 digits, no keyword — likely false positive
-    if pi_type == "State Passport Number":
-        return 88 if PASSPORT_KEYWORD.search(ctx) else 60
     if pi_type.startswith("Driving License"):
         return 95
     if pi_type == "Person Name":
@@ -1300,7 +1475,7 @@ def get_confidence(pi_type: str, match_text: str, text_context: str) -> int:
     if pi_type == "State":
         return 70
     return 80
-# ------------------------ DOB patterns ------------------------
+# DOB patterns
 ISO_YYYY_MM_DD = r"""
 \b
 (?:
@@ -1411,9 +1586,7 @@ DOB_PATTERNS = [
 ]
 
 
-# SHARED STANDALONE PII DETECTOR
-# Used by DOCX paragraphs, PDF pages, and DOCX/PDF table rows
-# Keeps the 3 pairs intact and adds all other PII as individual rows
+# Standalone PII detector — used by DOCX, PDF, and table rows
 def _detect_standalone_pii(
     text: str,
     file_name: str,
@@ -1422,12 +1595,7 @@ def _detect_standalone_pii(
     records: List[Dict[str, Any]],
     seen: set,
 ) -> None:
-    """
-    Detect all PII types EXCEPT the three pairs (Name+Email, Name+DOB, Name+CompanyID).
-    Those are handled separately by emit_grouped_records.
-    Each hit is added as an individual row.
-    Context gates applied: Account Number needs banking keywords, Passport needs keyword.
-    """
+    """Detect all PII types except name pairs (handled by emit_grouped_records). Each hit is added as an individual row."""
     if not text or not text.strip():
         return
 
@@ -1444,54 +1612,54 @@ def _detect_standalone_pii(
     for v in find_ssn_in_text(text):
         _add("SSN Number", v, 100)
 
-    # Voter ID (standalone  always scan regardless of context)
+    # Voter ID (always scan regardless of context)
     for m in re.finditer(pi_PATTERNS["Voter ID"], text):
         _add("Voter ID", m.group(0), 90)
 
-    # Standalone Person Names (detected independently of pairs)
+    # Standalone person names
     names = extract_person_names(text)
     for name in names:
         # Only accept title-case names
         if re.match(r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+$", name):
             _add("Person Name", name, 90)
 
-    # Pre-collect Aadhaar spans so Phone doesn't double-match them
+    # Pre-collect Aadhaar spans to avoid Phone double-matching them
     _aadhaar_spans = [(m.start(), m.end()) for m in re.finditer(pi_PATTERNS["Aadhaar Number"], text)]
     def _overlaps_aadhaar(s, e):
         return any(not (e <= a or s >= b) for a, b in _aadhaar_spans)
 
-    # Phone  capture opening bracket when regex misses it
+    # Phone — grab opening bracket if the regex missed it
     for m in re.finditer(pi_PATTERNS["Phone"], text):
         v = m.group(0)
         s = m.start()
         if s > 0 and text[s-1] == "(" and not v.startswith("("):
             v = "(" + v
-        # Skip SSN format
+        # skip SSN format
         if re.match(r"^\d{3}-\d{2}-\d{4}$", v.strip()):
             continue
-        # Skip if overlapping an Aadhaar number
+        # skip if overlapping an Aadhaar number
         if _overlaps_aadhaar(m.start(), m.end()):
             continue
-        # Skip if it looks like an IP address fragment (contains dots)
+        # skip if it looks like an IP address fragment
         if '.' in v and re.search(r'\d+\.\d+\.\d+', v):
             continue
         _add("Phone", v, 88)
 
-    # Indian Phone  skip if the number appears to be a bank account number in context
+    # Indian Phone — skip if the number looks like a bank account number
     _ACCT_NEARBY_RE = re.compile(r"\b(?:account|acct|a\/c|bank\s+account)\b", re.IGNORECASE)
     for m in re.finditer(pi_PATTERNS["Indian Phone"], text):
         v = m.group(0)
-        # Check 40-char window before the match for account keywords
+        # check 40-char window before the match for account keywords
         window = text[max(0, m.start()-40):m.start()]
         if _ACCT_NEARBY_RE.search(window):
             continue  # this is an account number, not a phone
         _add("Indian Phone", m.group(0), 92)
 
-    # Email (standalone  not paired with a name here)
+    # Email (standalone — not paired here)
     for m in re.finditer(pi_PATTERNS["email"], text):
         _add("email", m.group(0), 100)
 
-    # Credit/Debit Card  Luhn validated
+    # Credit/Debit Card — Luhn validated
     for m in re.finditer(pi_PATTERNS["Credit/Debit Card"], text):
         v = m.group(0)
         if passes_luhn(v):
@@ -1513,88 +1681,110 @@ def _detect_standalone_pii(
     for m in re.finditer(pi_PATTERNS["IFSC Code"], text):
         _add("IFSC Code", m.group(0), 96)
 
-    # US Passport  requires passport keyword nearby
+    # US Passport — requires keyword nearby and specifically before the value
     for m in re.finditer(pi_PATTERNS["US Passport Number"], text):
         v = m.group(0).strip()
+        # keyword must be within 25 chars before this value
+        window_before = text[max(0, m.start()-25): m.start()]
+        kw_nearby = bool(PASSPORT_KEYWORD.search(window_before))
         if re.match(r"^[A-Z]\d{8}$", v):
-            # Letter+8digits: only flag with explicit Passport keyword nearby
-            if PASSPORT_KEYWORD.search(text):
+            if kw_nearby or PASSPORT_KEYWORD.search(text):
                 _add("US Passport Number", v, 95)
-            # else: skip  likely a Company ID or DL number
-        elif PASSPORT_9D_RE.match(v) and PASSPORT_KEYWORD.search(text):
+        elif PASSPORT_9D_RE.match(v) and kw_nearby:
+            # 9-digit: only emit when passport keyword is directly before this value
             _add("US Passport Number", v, 95)
 
-    # Driving Licence (context-gated)
+    # Driving license (context-gated)
     for state, full_value, _ in iter_dl_matches(text, col_name=None, require_context=True):
         _add(f"Driving License ({state})", full_value, 95)
 
-    # Address  full street pattern + suite-lead pattern
+    # Address — collect all candidates then drop substrings of longer matches
     flat = re.sub(r"[\r\n\t]+", " ", text)
+    _raw_addrs = []
     for m in re.findall(ADDRESS_PATTERN, flat, flags=re.IGNORECASE):
         v = m.strip()
         if v:
-            _add("Address", v, 80)
+            _raw_addrs.append((v, 80))
     for m in ADDRESS_SUITE_PATTERN.finditer(flat):
         v = m.group(0).strip()
         if v and len(v) > 8:
-            _add("Address", v, 78)
+            _raw_addrs.append((v, 78))
+    _raw_addrs_sorted = sorted(_raw_addrs, key=lambda x: len(x[0]), reverse=True)
+    _kept_addrs = []
+    for v, conf in _raw_addrs_sorted:
+        if not any(v != longer and v in longer for longer, _ in _kept_addrs):
+            _kept_addrs.append((v, conf))
+    for v, conf in _kept_addrs:
+        _add("Address", v, conf)
 
-    # City, STATE ZIP fragment even without a street
-    
+    # City/state/ZIP fragment even without a street number
     _CITY_STATE_PIN_RE = re.compile(
         r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?),\s*([A-Z]{2})\s+(\d{5,6})\b"
     )
     for m in _CITY_STATE_PIN_RE.finditer(flat):
-        _add("Address", m.group(0).strip(), 78)
+        frag = m.group(0).strip()
+        # Only add if not already covered by a longer address
+        if not any(frag in longer for longer, _ in _kept_addrs):
+            _add("Address", frag, 78)
 
-        # Standalone Date of Birth  catches DD/MM/YYYY in paragraphs (S6 Suresh, Meera)
+    # Standalone date of birth
     _dob_iso = first_valid_dob_iso(text)
     if _dob_iso:
         _add("Date of Birth", _dob_iso, 90)
 
-    ## Account Number (banking keyword required; skip Luhn matches and Indian Phone
+    # Account Number — banking keyword required; skip Luhn and Indian phone matches
     _indian_phone_re = re.compile(r"^[6-9]\d{9}$")
+    # Build set of passport values that were actually emitted, so we don't skip routing numbers
+    _passport_vals = set()
+    for _m in re.finditer(pi_PATTERNS["US Passport Number"], text):
+        _v = _m.group(0).strip()
+        _wb = text[max(0, _m.start()-25): _m.start()]
+        if PASSPORT_KEYWORD.search(_wb) or (re.match(r"^[A-Z]\d{8}$", _v) and PASSPORT_KEYWORD.search(text)):
+            _passport_vals.add(_v)
     for m in re.finditer(pi_PATTERNS["Account Number"], text):
         v = m.group(0)
         digits = re.sub(r"\D", "", v)
         if passes_luhn(v):
-            continue  # already a Credit Card
-        # Override if Account keyword is right before the value
+            continue  # already flagged as a credit card
+        # skip if already identified as a passport number
+        if v.strip() in _passport_vals:
+            continue
+        # override if an account keyword is right before the value
         explicit = _is_explicit_account(v, text)
         if _indian_phone_re.match(digits) and not explicit:
-            continue  # looks like an Indian phone number (unless explicitly labelled Account)
+            continue
         if not _has_account_context(text):
             continue
-        # Tag as Routing Number if routing keyword is nearby
+        # tag as routing number if routing keyword is nearby
         if _is_routing_number(v, text):
             _add("Routing Number", v, 90)
         else:
             _add("Account Number", v, 90 if len(digits) >= 12 else 80)
 
-    # MRN (medical keyword required)
+    # MRN — medical keyword required
     for m in MRN_RE.finditer(text):
         if _has_mrn_context(text):
             _add("MRN", m.group(1) or m.group(2) or "", 90)
 
     # Insurance ID
     for m in INSURANCE_ID_RE.finditer(text):
-        _add("Insurance ID", m.group(1), 88)
+        _add("Insurance ID", m.group(1) or m.group(2) or "", 88)
+
+    # Company ID — EMP-prefixed values are unambiguous, others need positive context
+    for m in ALNUM_COMPANY_ID_RE.finditer(text):
+        token = m.group(0)
+        if is_company_id(token, context=text):
+            _add("Company ID", token, 90)
 
     # Gender
     for val in detect_gender_values(text):
         _add("Gender", val, 85)
 
 
-# PDF PI SCAN
+# PDF scanner
 
 def _normalize_pdf_page(text: str) -> str:
-    """
-    Fix PyPDF2 extraction artifacts before PII scanning:
-    - "1957 -02-10" → "1957-02-10"  (space before dash)
-    - "253 -75-\n9741" → "253-75-9741"  (number split across lines)
-    - "(408) \n321-9136" → "(408) 321-9136"  (phone split across lines)
-    - "Luna\nWhite" → "Luna White"  (name split across lines)
-    """
+    """Fix PyPDF2 extraction artifacts before PII scanning (broken numbers, split names, etc.)."""
     import re as _r
 
     text = _r.sub(r"(\w) +-", r"\1-", text)
@@ -1606,20 +1796,33 @@ def _normalize_pdf_page(text: str) -> str:
         changed = False
         while i < len(lines):
             cur = lines[i].rstrip()
-            if cur.endswith("-") and i + 1 < len(lines):
-                out.append(cur + lines[i + 1].lstrip())
-                i += 2
-                changed = True
-            else:
-                out.append(cur)
-                i += 1
+            if i + 1 < len(lines):
+                nxt = lines[i + 1]
+                # join lines ending with a hyphen (split words/numbers)
+                if cur.endswith("-"):
+                    out.append(cur + nxt.lstrip())
+                    i += 2
+                    changed = True
+                    continue
+                # Join lines ending with comma+space where next continues an address
+                # e.g. "509 River Rd, Suite 755, " + "Denver, CO 98706"
+                elif cur.endswith(", ") or cur.endswith(","):
+                    nxt_stripped = nxt.strip()
+                    # only join if next line starts with a capital word (address continuation)
+                    if nxt_stripped and nxt_stripped[0].isupper() and not _r.match(r"^(Scenario|Section|Page|Note|Dear|Hello|From|To|Subject)\b", nxt_stripped):
+                        out.append(cur.rstrip() + " " + nxt_stripped)
+                        i += 2
+                        changed = True
+                        continue
+            out.append(cur)
+            i += 1
         text = "\n".join(out)
         if not changed:
             break
 
     text = _r.sub(r"\((\d{3})\)\s*\n\s*(\d)", r"(\1) \2", text)
 
-    ## Must run BEFORE the name-join pass so we don't accidentally join "Francisco
+    # must run before the name-join pass
     _CITY_TOKENS_P4 = {
         "MIAMI","SEATTLE","RALEIGH","ATLANTA","DALLAS","DENVER","DETROIT","CHICAGO",
         "HOUSTON","PHOENIX","BOSTON","AUSTIN","PORTLAND","MEMPHIS","NASHVILLE",
@@ -1693,7 +1896,7 @@ def find_pi_in_pdf(pdf_file) -> List[Dict[str, Any]]:
     seen: set[tuple] = set()  # for _add_record de-dup (per file)
     file_name = Path(getattr(pdf_file, "name", "document.pdf")).name
 
-    # Safe reset for file-like streams 
+    # safe reset for file-like streams
     try:
         pdf_file.seek(0)
     except Exception:
@@ -1715,7 +1918,7 @@ def find_pi_in_pdf(pdf_file) -> List[Dict[str, Any]]:
         if not page_text.strip():
             continue
 
-        # Full normalization
+        # normalize the page
         page_text = _normalize_pdf_page(page_text)
 
  
@@ -1791,33 +1994,16 @@ def find_pi_in_pdf(pdf_file) -> List[Dict[str, Any]]:
                                 value=rec["Detected Value"],
                                 confidence=rec["Confidence (%)"],
                             )
-                        # Standalone PII for this table row
+                        # standalone PII for this table row
                         _detect_standalone_pii(line, file_name,
                             f"Page {page_idx} (Table {tbl_idx})", f"Row {r_idx}", records, seen)
 
-                    if len(all_row_lines) > 1:
-                        whole_table_text = " | ".join(all_row_lines)
-                        for rec in emit_grouped_records(
-                            file_name=file_name,
-                            page_or_sheet=f"Page {page_idx} (Table {tbl_idx})",
-                            cell="",
-                            block_text=whole_table_text,
-                            pair_only=True,
-                        ):
-                            _add_record(
-                                records, seen,
-                                file_name=rec["File"],
-                                page_sheet=rec["Page/Sheet"],
-                                cell=rec["Cell"],
-                                pi_type=rec["PI Type"],
-                                value=rec["Detected Value"],
-                                confidence=rec["Confidence (%)"],
-                            )
+                    # whole-table combined block is intentionally disabled to prevent cross-person pairings
     except Exception as e:
         import traceback; traceback.print_exc()
         print(f"✖ pdfplumber tables failed for {file_name}: {e}")
 
-    # CROSS-BLOCK PAIRING (sliding window per page)
+    # Cross-block pairing using a sliding window per page
     try:
         pdf_file.seek(0)
     except Exception:
@@ -1828,9 +2014,9 @@ def find_pi_in_pdf(pdf_file) -> List[Dict[str, Any]]:
         reader2 = None
 
     _SCENARIO_BREAK_PDF = re.compile(
-        r"^(?:scenario\s+\d|page\s+\d|scenario\s+[·\-]|note:|disclaimer)", re.IGNORECASE
+        r"^(?:scenario\s+\d|section\s+\d|page\s+\d|scenario\s+[·\-]|note:|disclaimer)", re.IGNORECASE
     )
-    WINDOW_PDF = 12
+    WINDOW_PDF = 8
 
     if reader2:
         for page_idx, page in enumerate(reader2.pages, start=1):
@@ -1850,8 +2036,7 @@ def find_pi_in_pdf(pdf_file) -> List[Dict[str, Any]]:
                 if not anchor_names:
                     continue
 
-                # If the anchor line ALREADY has an email, pair within the line only.
-                # Extending the window would steal emails from adjacent table rows.
+                # If the anchor already has an email, pair within that line only to avoid stealing from adjacent rows.
                 _anchor_has_email = bool(re.search(pi_PATTERNS["email"], anchor_line))
                 if _anchor_has_email:
                     for rec in emit_grouped_records(
@@ -1865,8 +2050,7 @@ def find_pi_in_pdf(pdf_file) -> List[Dict[str, Any]]:
                         )
                     continue   # don't extend window for this anchor
 
-                # Build combined window  stop if a line has its OWN name+email
-                # (that line is a self-contained table row for a different person)
+                # Build a combined window — stop if a line has its own name+email pair
                 window_parts: List[str] = [anchor_line]
                 for j in range(i + 1, min(i + WINDOW_PDF, len(page_lines))):
                     nxt = page_lines[j]
@@ -1881,7 +2065,7 @@ def find_pi_in_pdf(pdf_file) -> List[Dict[str, Any]]:
                 if len(window_parts) <= 1:
                     continue
                 combined = " ".join(window_parts)
-                # Emit pairs from combined window
+                # emit pairs from combined window
                 for rec in emit_grouped_records(
                     file_name, f"Page {page_idx}", "", combined, pair_only=True
                 ):
@@ -1892,18 +2076,19 @@ def find_pi_in_pdf(pdf_file) -> List[Dict[str, Any]]:
                         value=rec["Detected Value"], confidence=rec["Confidence (%)"],
                     )
 
-    # IMPORTANT: No other detectors here (keeps output minimal & paired).
+    # No other detectors here — this keeps output minimal and paired.
     return records
 
 
-# EXCEL PI SCAN
+# Excel scanner
 
 def find_pi_in_excel(excel_file) -> List[Dict[str, Any]]:
 
     records: List[Dict[str, Any]] = []
+    seen: set[tuple] = set()
     file_name = Path(getattr(excel_file, "name", "workbook.xlsx")).name
 
-    # Stream reset (if applicable)
+    # stream reset if applicable
     try:
         excel_file.seek(0)
     except Exception:
@@ -1915,39 +2100,38 @@ def find_pi_in_excel(excel_file) -> List[Dict[str, Any]]:
     for sheet_name in xls.sheet_names:
         df = xls.parse(sheet_name=sheet_name, dtype=str)
 
-        # ---- Header hints ----
-        # name_hint_cols: ALL name-like columns (FullName, FirstName, LastName)  used for standalone Person Name
+        # header hints
+        # name_hint_cols: all name-like columns (FullName, FirstName, LastName)
         name_hint_cols = {c for c in df.columns if NAME_COL_HINT_RE.search(str(c))}
-        # full_name_cols: only FullName/Name columns  preferred for pair (Name+DOB, Name+CID) detection
+        # full_name_cols: only FullName/Name columns, preferred for pair detection
         full_name_cols = {c for c in df.columns if FULL_NAME_COL_RE.search(str(c))}
         id_hint_cols   = {c for c in df.columns if ID_COL_HINT_RE.search(str(c))}
         dob_hint_cols  = {c for c in df.columns if DOB_COL_HINT_RE.search(str(c))}
 
         for row_idx, row in df.iterrows():
-            ## ---------- First pass: collect Name / Company ID / DOB / Email hits from
-            row_name_hits:  List[tuple[str, str]] = []  # (value, column)
-            row_id_hits:    List[tuple[str, str]] = []  # (value, column)
-            row_dob_hits:   List[tuple[str, str]] = []  # (iso_dob, column)
-            row_email_hits: List[tuple[str, str]] = []  # (email, column)
+            # First pass: collect Name / Company ID / DOB / Email hits
+            row_name_hits:    List[tuple[str, str]] = []
+            row_id_hits:      List[tuple[str, str]] = []
+            row_dob_hits:     List[tuple[str, str]] = []
+            row_email_hits:   List[tuple[str, str]] = []
+            row_phone_hits:   List[tuple[str, str]] = []
+            row_addr_hits:    List[tuple[str, str]] = []
+            row_state_hits:   List[tuple[str, str]] = []
+            row_gender_hits:  List[tuple[str, str]] = []
+            row_city_hits:    List[tuple[str, str]] = []
 
             for col_name, cell_value in row.items():
                 text = _to_text(cell_value)
                 if not text:
                     continue
 
-                # Person name  prefer full cell text when it looks like a name
-                
-                # For FirstName/LastName columns: accept single-word values directly
                 col_is_name_hint = NAME_COL_HINT_RE.search(str(col_name))
                 col_is_full_name = FULL_NAME_COL_RE.search(str(col_name))
                 words = text.split()
                 if col_is_name_hint:
-                    # Column header says this is a name  trust the cell value directly
-                    
                     if not re.search(r'\d', text) and 1 <= len(words) <= 5:
                         row_name_hits.append((text.strip(), str(col_name)))
                 else:
-                    # Free-text cell  use NER
                     names_here = extract_person_names(text)
                     if names_here:
                         if len(words) <= 4 and not re.search(r'\d', text):
@@ -1960,27 +2144,55 @@ def find_pi_in_excel(excel_file) -> List[Dict[str, Any]]:
                 for em in email_m:
                     row_email_hits.append((em, str(col_name)))
 
-                # Company ID full-matches (alnum or 6-digit numeric)
-                # Skip if: column is passport/MRN/routing/insurance, OR value is passport-format
+                # Phone (only from phone-hinted columns to avoid false positives)
+                _col_lo_p = str(col_name).lower()
+                if any(k in _col_lo_p for k in ('phone', 'mobile', 'cell', 'contact', 'tel')):
+                    for pm in re.finditer(pi_PATTERNS["Phone"], text):
+                        row_phone_hits.append((pm.group(0), str(col_name)))
+                    for pm in re.finditer(pi_PATTERNS["Indian Phone"], text):
+                        row_phone_hits.append((pm.group(0), str(col_name)))
+
+                # Address (only from address-hinted columns)
+                if any(k in _col_lo_p for k in ('address', 'street', 'addr')):
+                    if text.strip():
+                        row_addr_hits.append((text.strip(), str(col_name)))
+
+                # State (only from state-hinted columns)
+                if any(k in _col_lo_p for k in ('state', 'province', 'region')):
+                    if text.strip():
+                        row_state_hits.append((text.strip(), str(col_name)))
+
+                # City (only from city-hinted columns)
+                if any(k in _col_lo_p for k in ('city', 'town', 'district')):
+                    if text.strip() and re.match(r'^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*$', text.strip()):
+                        row_city_hits.append((text.strip(), str(col_name)))
+
+                # Gender (only from gender-hinted columns)
+                if any(k in _col_lo_p for k in ('gender', 'sex')):
+                    gvals = detect_gender_values(text)
+                    for gv in gvals:
+                        row_gender_hits.append((gv, str(col_name)))
+
+                # Company ID
                 _col_lo = str(col_name).lower()
                 _skip_cid = (
                     any(k in _col_lo for k in ('passport','mrn','medical','routing','route',
                                                'insurance','insurance_id','aba','sort_code'))
-                    or re.match(r'^[A-Z]\d{8}$', text)   # letter+8digits = passport format
-                    or re.match(r'^MRN', text, re.IGNORECASE)  # MRN-prefixed
-                    or re.match(r'^INS', text, re.IGNORECASE)  # Insurance ID prefix
-                    or re.match(r'^[A-Z]{3}\d{7}$', text)     # Voter ID format
+                    or re.match(r'^[A-Z]\d{8}$', text)
+                    or re.match(r'^MRN', text, re.IGNORECASE)
+                    or re.match(r'^INS', text, re.IGNORECASE)
+                    or re.match(r'^[A-Z]{3}\d{7}$', text)
                 )
                 if not _skip_cid:
                     if ALNUM_COMPANY_ID_RE.fullmatch(text) or COMPANY_ID_RE_NUM.fullmatch(text):
                         row_id_hits.append((text, str(col_name)))
 
-                # DOB (normalize to ISO)
+                # DOB
                 dob_iso = first_valid_dob_iso(text)
                 if dob_iso:
                     row_dob_hits.append((dob_iso, str(col_name)))
 
-            # Prefer full-name columns for pair detection; fall back to any name hit
+            # prefer full-name columns for pair detection; fall back to any name hit
             def pick_best(hits: List[tuple[str, str]], preferred_cols: set[str]) -> tuple[str | None, str | None]:
                 if not hits:
                     return None, None
@@ -1989,67 +2201,62 @@ def find_pi_in_excel(excel_file) -> List[Dict[str, Any]]:
                         return val, col
                 return hits[0]
 
-            # Email column hint
-            email_hint_cols = {c for c in df.columns if re.search(r'\b(e[\-_]?mail|email[\s_]?address)\b', str(c), re.IGNORECASE)}
 
-            # For pairs: prefer the FullName column; for standalone: any name column is fine
-            name_val, name_col = pick_best(row_name_hits, full_name_cols or name_hint_cols)
-            id_val,   id_col   = pick_best(row_id_hits,   id_hint_cols)
-            dob_val,  dob_col  = pick_best(row_dob_hits,  dob_hint_cols)
-            email_val, email_col = pick_best(row_email_hits, email_hint_cols)
+            email_hint_cols  = {c for c in df.columns if re.search(r'\b(e[\-_]?mail|email[\s_]?address)\b', str(c), re.IGNORECASE)}
+            phone_hint_cols  = {c for c in df.columns if re.search(r'\b(phone|mobile|cell|tel)\b', str(c), re.IGNORECASE)}
+            addr_hint_cols   = {c for c in df.columns if re.search(r'\b(address|street|addr)\b', str(c), re.IGNORECASE)}
+            state_hint_cols  = {c for c in df.columns if re.search(r'\b(state|province)\b', str(c), re.IGNORECASE)}
+            city_hint_cols   = {c for c in df.columns if CITY_COL_HINT_RE.search(str(c))}
+            gender_hint_cols = {c for c in df.columns if re.search(r'\b(gender|sex)\b', str(c), re.IGNORECASE)}
 
-            # ---------- Emit consolidated rows ----------
+            name_val,   name_col   = pick_best(row_name_hits,   full_name_cols or name_hint_cols)
+            id_val,     id_col     = pick_best(row_id_hits,     id_hint_cols)
+            dob_val,    dob_col    = pick_best(row_dob_hits,    dob_hint_cols)
+            email_val,  email_col  = pick_best(row_email_hits,  email_hint_cols)
+            phone_val,  phone_col  = pick_best(row_phone_hits,  phone_hint_cols)
+            addr_val,   addr_col   = pick_best(row_addr_hits,   addr_hint_cols)
+            state_val,  state_col  = pick_best(row_state_hits,  state_hint_cols)
+            city_val,   city_col   = pick_best(row_city_hits,   city_hint_cols)
+            gender_val, gender_col = pick_best(row_gender_hits, gender_hint_cols)
+
             paired_cols: set[str] = set()
 
-            # Name + email
+            def _emit_pair(pi_type, name, val, col_a, col_b, conf=95):
+                records.append({"File": file_name, "Page/Sheet": sheet_name,
+                                 "Cell": f"Row {row_idx + 2}", "PI Type": pi_type,
+                                 "Detected Value": f"{name}, {val}", "Confidence (%)": conf})
+                paired_cols.update({col_a, col_b})
+
             if name_val and email_val:
-                records.append({
-                    "File": file_name,
-                    "Page/Sheet": sheet_name,
-                    "Cell": f"Row {row_idx + 2}",
-                    "PI Type": "Name, email",
-                    "Detected Value": f"{name_val}, {email_val}",
-                    "Confidence (%)": 98 if use_spacy else 95,
-                })
-                paired_cols.update({name_col, email_col})
-
-            # Name + Company ID
+                _emit_pair("Name, email",        name_val, email_val,  name_col, email_col,  98 if use_spacy else 95)
             if name_val and id_val:
-                records.append({
-                    "File": file_name,
-                    "Page/Sheet": sheet_name,
-                    "Cell": f"Row {row_idx + 2}",
-                    "PI Type": "Name, Company ID",
-                    "Detected Value": f"{name_val}, {id_val}",
-                    "Confidence (%)": 98 if use_spacy else 95,
-                })
-                paired_cols.update({name_col, id_col})
-
-            # Name + DOB (ISO)
+                _emit_pair("Name, Company ID",   name_val, id_val,     name_col, id_col,     98 if use_spacy else 95)
             if name_val and dob_val:
-                records.append({
-                    "File": file_name,
-                    "Page/Sheet": sheet_name,
-                    "Cell": f"Row {row_idx + 2}",
-                    "PI Type": "Name, Date of Birth",
-                    "Detected Value": f"{name_val}, {dob_val}",
-                    "Confidence (%)": 98 if use_spacy else 95,
-                })
-                paired_cols.update({name_col, dob_col})
+                _emit_pair("Name, Date of Birth",name_val, dob_val,    name_col, dob_col,    98 if use_spacy else 95)
+            if name_val and phone_val:
+                _emit_pair("Name, Phone",        name_val, phone_val,  name_col, phone_col,  95)
+            if name_val and addr_val:
+                _emit_pair("Name, Address",      name_val, addr_val,   name_col, addr_col,   95)
+            if name_val and city_val:
+                _emit_pair("Name, City",         name_val, city_val,   name_col, city_col,   85)
+            if name_val and state_val:
+                _emit_pair("Name, State",        name_val, state_val,  name_col, state_col,  90)
+            if name_val and gender_val:
+                _emit_pair("Name, Gender",       name_val, gender_val, name_col, gender_col, 90)
 
-            ## ---------- Second pass: per-cell PII (skip duplicates on paired cells)
+            # Second pass: per-cell PII, skipping cells already used in a pair
             for col_name, cell_value in row.items():
                 text = _to_text(cell_value)
                 if not text:
                     continue
 
-                ## If this cell contributed to ANY pair (Name+CID or Name+DOB), skip
+                # skip if this cell was part of a pair
                 in_paired_cell = str(col_name) in paired_cols
 
                 # Column header hints
                 col_hint_is_id = bool(ID_COL_HINT_RE.search(str(col_name)))
 
-                # Skip DL on (paired cells) OR (ID-like headers) OR (full-match company ID)
+                # skip DL for paired cells, ID-like headers, or full-match company IDs
                 skip_dl_for_cell = (
                     in_paired_cell
                     or col_hint_is_id
@@ -2067,7 +2274,7 @@ def find_pi_in_excel(excel_file) -> List[Dict[str, Any]]:
                         "Confidence (%)": 95,
                     })
 
-                ## Company ID override (only if not a paired cell and not a
+                # Company ID override (only if not a paired cell)
                 _col_lo2 = str(col_name).lower()
                 _skip_cid2 = (
                     any(k in _col_lo2 for k in ('passport','mrn','medical','routing','route',
@@ -2090,12 +2297,11 @@ def find_pi_in_excel(excel_file) -> List[Dict[str, Any]]:
                     })
                     # no 'continue': still allow other PII (email/phone/etc.)
 
-                # Person Name (only if not paired)
+                # Person Name (only if not a paired cell)
                 if not in_paired_cell:
                     col_is_name_col = bool(NAME_COL_HINT_RE.search(str(col_name)))
                     if col_is_name_col:
-                        # Trust the column header  emit the cell value directly as a Person Name
-                        # (handles FullName, FirstName, LastName columns)
+                        # trust the column header and emit the cell value directly as a Person Name
                         words_n = text.split()
                         if 1 <= len(words_n) <= 5 and not re.search(r'\d', text) and not _is_bad_label(text):
                             records.append({
@@ -2117,21 +2323,33 @@ def find_pi_in_excel(excel_file) -> List[Dict[str, Any]]:
                                 "Confidence (%)": 95 if use_spacy else 85,
                             })
 
-                # States
-                states_detected = detect_states(text)
-                if states_detected:
-                    records.append({
-                        "File": file_name,
-                        "Page/Sheet": sheet_name,
-                        "Cell": f"{col_name} (Row {row_idx + 2})",
-                        "PI Type": "State",
-                        "Detected Value": states_detected,
-                        "Confidence (%)": 75,
-                    })
+                # States — skip address/street columns since Indian state codes appear in addresses too
+                _col_is_addr = any(k in str(col_name).lower() for k in ('address','street','addr','location'))
+                if not _col_is_addr:
+                    states_detected = detect_states(text)
+                    if states_detected:
+                        records.append({
+                            "File": file_name,
+                            "Page/Sheet": sheet_name,
+                            "Cell": f"{col_name} (Row {row_idx + 2})",
+                            "PI Type": "State",
+                            "Detected Value": states_detected,
+                            "Confidence (%)": 75,
+                        })
 
                 # DL (context-gated)
                 if not skip_dl_for_cell:
                     for state, full_value, core in iter_dl_matches(text, col_name=str(col_name), require_context=True):
+                        # if the cell has an explicit 2-letter state prefix, use that rather than the pattern-matched state
+                        _explicit_prefix = re.match(r'^([A-Z]{2})[-\s]', text.strip())
+                        if _explicit_prefix:
+                            declared_state = _explicit_prefix.group(1).upper()
+                            # only override when it's a known US state
+                            if declared_state in US_DL_PATTERNS or declared_state in _PURE_DIGIT_DL_STATES:
+                                state = declared_state
+                                full_value = text.strip()  # use the original cell value as-is
+                        elif not full_value.upper().startswith(state):
+                            full_value = f"{state}-{full_value}"
                         records.append({
                             "File": file_name,
                             "Page/Sheet": sheet_name,
@@ -2141,13 +2359,13 @@ def find_pi_in_excel(excel_file) -> List[Dict[str, Any]]:
                             "Confidence (%)": 95,
                         })
 
-                # MRN column detection
+                # MRN
                 _col_is_mrn = bool(re.search(
                     r'(?:^|_|\s)(?:mrn|medical(?:record)?(?:number|no|num)?)',
                     str(col_name), re.IGNORECASE
                 ))
                 if _col_is_mrn:
-                    # Column is explicitly MRN  emit the full cell value directly
+                    # column is explicitly MRN — emit the full cell value
                     if text.strip():
                         records.append({
                             "File": file_name,
@@ -2170,8 +2388,8 @@ def find_pi_in_excel(excel_file) -> List[Dict[str, Any]]:
                                 "Confidence (%)": 95,
                             })
 
-                # Routing Number  detect when column name contains 'routing'
-                _col_is_routing = bool(re.search(r'\b(?:routing|aba)\b', str(col_name), re.IGNORECASE))
+                # Routing Number — detect when column header mentions routing
+                _col_is_routing = bool(re.search(r'\b(?:routing|aba|routing\s*number)\b', str(col_name), re.IGNORECASE))
                 if _col_is_routing and re.match(r'^\d{9}$', text.strip()):
                     records.append({
                         "File": file_name,
@@ -2180,6 +2398,27 @@ def find_pi_in_excel(excel_file) -> List[Dict[str, Any]]:
                         "PI Type": "Routing Number",
                         "Detected Value": text.strip(),
                         "Confidence (%)": 95,
+                    })
+
+                # Insurance ID
+                _col_is_insurance = bool(re.search(r'\b(?:insurance|insur|policy)\b', str(col_name), re.IGNORECASE))
+                if _col_is_insurance and text.strip():
+                    records.append({
+                        "File": file_name,
+                        "Page/Sheet": sheet_name,
+                        "Cell": f"{col_name} (Row {row_idx + 2})",
+                        "PI Type": "Insurance ID",
+                        "Detected Value": text.strip(),
+                        "Confidence (%)": 92,
+                    })
+                elif re.match(r'^INS[-\s]', text.strip(), re.IGNORECASE):
+                    records.append({
+                        "File": file_name,
+                        "Page/Sheet": sheet_name,
+                        "Cell": f"{col_name} (Row {row_idx + 2})",
+                        "PI Type": "Insurance ID",
+                        "Detected Value": text.strip(),
+                        "Confidence (%)": 90,
                     })
 
                 # Address
@@ -2195,7 +2434,7 @@ def find_pi_in_excel(excel_file) -> List[Dict[str, Any]]:
                             "Confidence (%)": 75,
                         })
 
-                # Date of Birth (only if not paired)  emits ISO earliest plausible date from the cell
+                # Date of Birth (only if not in a pair)
                 if not in_paired_cell:
                     dob_iso = first_valid_dob_iso(text)
                     if dob_iso:
@@ -2208,8 +2447,7 @@ def find_pi_in_excel(excel_file) -> List[Dict[str, Any]]:
                             "Confidence (%)": 95,
                         })
 
-                # Other regex PI
-                # Pre-compute Aadhaar spans so Phone doesn't overlap them
+                # Other regex PII — pre-compute Aadhaar spans to avoid Phone overlap
                 _cell_aadhaar = [(m.start(), m.end()) for m in re.finditer(pi_PATTERNS["Aadhaar Number"], text)]
                 def _aadhaar_overlap(s, e):
                     return any(not (e <= a or s >= b) for a, b in _cell_aadhaar)
@@ -2225,15 +2463,15 @@ def find_pi_in_excel(excel_file) -> List[Dict[str, Any]]:
                             col_str = str(col_name).lower()
                             _is_routing_col = any(k in col_str for k in ("routing","route","aba","sort_code"))
                             _is_account_col = any(k in col_str for k in ("account","acct","bank","mrn","medical","insurance"))
-                            # Pure 9-digit passport requires passport keyword or a passport-hinted column
+                            # pure 9-digit passport needs a keyword or a passport-hinted column
                             _is_9d = bool(re.match(r'^\d{9}$', value))
                             _col_is_passport = any(k in col_str for k in ("passport","pass_no","pass_num"))
                             if _is_9d and (_is_routing_col or _is_account_col) and not _col_is_passport:
-                                continue  # routing/account number masquerading as passport
+                                continue  # routing/account number, not a passport
                             if _is_9d and not _col_is_passport and not PASSPORT_KEYWORD.search(text):
-                                # 9-digit value in a non-passport column with no keyword → skip
+                                # 9-digit value in a non-passport column with no keyword — skip
                                 continue
-                            # Letter+8digit in a passport-hinted column → high confidence
+                            # letter+8digit in a passport-hinted column
                             if _col_is_passport:
                                 records.append({
                                     "File": file_name,
@@ -2244,11 +2482,11 @@ def find_pi_in_excel(excel_file) -> List[Dict[str, Any]]:
                                     "Confidence (%)": 95,
                                 })
                                 continue
-                        # For Account Number in Excel: treat column name as additional context
+                        # Account Number in Excel — treat column name as additional context
                         if pi_type == "Account Number":
                             if _has_account_context(text, col_name=str(col_name)):
                                 digits_v = re.sub(r"\D", "", value)
-                                # 9-digit numbers near routing keyword → tag as Routing Number
+                                # 9-digit numbers near routing keyword — tag as Routing Number
                                 if _is_routing_number(value, text) or "routing" in str(col_name).lower():
                                     conf = 90
                                     records.append({
@@ -2298,44 +2536,72 @@ def find_pi_in_excel(excel_file) -> List[Dict[str, Any]]:
                             "Confidence (%)": 80,
                         })
 
-    # Whole-sheet pair detection (for vertical key-value layouts)
-    # In key-value style sheets (Field/Value columns), Name and Email/DOB are in
-    # different rows, so per-row scanning misses the pair. We collect every cell value
-    # across the entire workbook into one proximity block per sheet and run pair
-    # detection once, which catches cross-row Name+Email, Name+DOB pairs.
-    for sheet_name in xls.sheet_names:
-        df_kv = xls.parse(sheet_name=sheet_name, dtype=str)
-        all_cell_values: List[str] = []
-        for _, row in df_kv.iterrows():
-            for val in row:
-                v = _to_text(val)
-                if v:
-                    all_cell_values.append(v)
-        if len(all_cell_values) < 2:
-            continue
-        sheet_block = " | ".join(all_cell_values)
-        for rec in emit_grouped_records(file_name, sheet_name, "", sheet_block, pair_only=True):
-            # Use _add_record so dedup prevents duplicates with per-row hits
-            _add_record(
-                records,
-                set(),  # fresh seen per this call; global dedup via clean_pi_data
-                file_name=rec["File"],
-                page_sheet=rec["Page/Sheet"],
-                cell=rec["Cell"],
-                pi_type=rec["PI Type"],
-                value=rec["Detected Value"],
-                confidence=rec["Confidence (%)"],
-            )
+    # Whole-sheet pair detection for key-value layout sheets only.
+    # Only runs when per-row scanning produced no pairs (vertical layout).
+    # Never runs on tabular data (each row = one person) to avoid cross-row false pairings.
+    _KV_SAFE_PAIRS = {"Name, email", "Name, Date of Birth", "Name, Company ID"}
+    _perrow_pair_types = {r.get("PI Type","") for r in records if r.get("PI Type","").startswith("Name,")}
+    _has_perrow_pairs = bool(_perrow_pair_types)
+    if not _has_perrow_pairs:
+        for sheet_name in xls.sheet_names:
+            df_kv = xls.parse(sheet_name=sheet_name, dtype=str)
+            all_cell_values: List[str] = []
+            for _, row in df_kv.iterrows():
+                for val in row:
+                    v = _to_text(val)
+                    if v:
+                        all_cell_values.append(v)
+            if len(all_cell_values) < 2:
+                continue
+            sheet_block = " | ".join(all_cell_values)
+            for rec in emit_grouped_records(file_name, sheet_name, "", sheet_block, pair_only=True):
+                if rec["PI Type"] not in _KV_SAFE_PAIRS:
+                    continue
+                _add_record(
+                    records,
+                    set(),
+                    file_name=rec["File"],
+                    page_sheet=rec["Page/Sheet"],
+                    cell=rec["Cell"],
+                    pi_type=rec["PI Type"],
+                    value=rec["Detected Value"],
+                    confidence=rec["Confidence (%)"],
+                )
+
+            # Also detect standalone account numbers in KV sheets when banking context exists
+            if _has_account_context(sheet_block):
+                _kv_seen_acct: set = set()
+                for _m in re.finditer(pi_PATTERNS["Account Number"], sheet_block):
+                    _av = _m.group(0)
+                    if _av in _kv_seen_acct:
+                        continue
+                    _kv_seen_acct.add(_av)
+                    # skip Luhn-valid values (credit cards) and Indian-phone-shaped values
+                    _ind_re_kv = re.compile(r'^[6-9]\d{9}$')
+                    if passes_luhn(_av):
+                        continue
+                    if _ind_re_kv.match(re.sub(r"\D", "", _av)) and not _is_explicit_account(_av, sheet_block):
+                        continue
+                    _add_record(
+                        records,
+                        set(),
+                        file_name=file_name,
+                        page_sheet=sheet_name,
+                        cell="",
+                        pi_type="Account Number",
+                        value=_av,
+                        confidence=85,
+                    )
 
     return records
 
-# DOCX PI SCAN
+# DOCX scanner
 def find_pi_in_docx(docx_file) -> List[Dict[str, Any]]:
     records: List[Dict[str, Any]] = []
     file_name = Path(getattr(docx_file, "name", "document.docx")).name
     seen: set[tuple] = set()  # for _add_record de-dup (per file)
 
-    # -- safe load to temp --
+    # load to a temp file first
     try:
         docx_file.seek(0)
     except Exception:
@@ -2352,8 +2618,8 @@ def find_pi_in_docx(docx_file) -> List[Dict[str, Any]]:
         try: os.remove(tmp_path)
         except Exception: pass
 
-    # Paragraphs: pairs + standalone 
-    para_texts: List[tuple[int, str]] = []  # (idx, text) for cross-para pairing
+    # Paragraphs — pairs and standalone PII
+    para_texts: List[tuple[int, str]] = []  # (idx, text) for cross-paragraph pairing
     for idx, para in enumerate(getattr(document, "paragraphs", []) or [], start=1):
         text = _to_text(getattr(para, "text", ""))
         if not text:
@@ -2368,15 +2634,17 @@ def find_pi_in_docx(docx_file) -> List[Dict[str, Any]]:
         _detect_standalone_pii(text, file_name, f"Paragraph {idx}", "NA", records, seen)
 
 
-    _SCENARIO_BREAK_RE = re.compile(r"^(?:scenario\s+\d|dear\s+hr|subject:|to:|from:)", re.IGNORECASE)
-    WINDOW = 12
+    _SCENARIO_BREAK_RE = re.compile(
+        r"^(?:scenario\s+\d|section\s+\d|dear\s+hr|subject:|to:|from:|page\s+\d)", re.IGNORECASE
+    )
+    WINDOW = 5
     for i in range(len(para_texts)):
         anchor_idx, anchor_text = para_texts[i]
-        # Only start a window from a paragraph that contains a name
+        # only start a window from a paragraph that contains a name
         anchor_names = extract_person_names(anchor_text)
         if not anchor_names:
             continue
-        ## Collect text from this paragraph + next WINDOW-1 paragraphs (stop at
+        # collect this paragraph + next WINDOW-1 paragraphs
         window_parts: List[str] = [anchor_text]
         for j in range(i + 1, min(i + WINDOW, len(para_texts))):
             _, nxt_text = para_texts[j]
@@ -2386,8 +2654,7 @@ def find_pi_in_docx(docx_file) -> List[Dict[str, Any]]:
         if len(window_parts) <= 1:
             continue  # nothing to extend
         combined = " ".join(window_parts)
-        # Run pair detection on combined block  only emit if the pair crosses paragraphs
-        # (i.e. it's NOT already in the single-paragraph results from step 1)
+        # run pair detection on combined block — only new cross-paragraph pairs are emitted
         combined_pairs = emit_grouped_records(
             file_name, f"Paragraph {anchor_idx}", "NA", combined, pair_only=True
         )
@@ -2397,19 +2664,19 @@ def find_pi_in_docx(docx_file) -> List[Dict[str, Any]]:
                 cell=rec["Cell"], pi_type=rec["PI Type"],
                 value=rec["Detected Value"], confidence=rec["Confidence (%)"])
 
-    ## -------- Tables: one row = one proximity block; grouping-only (pairs-only)
+    # Tables — one row per proximity block, pairs only
     for t_idx, table in enumerate(getattr(document, "tables", []) or [], start=1):
         try:
             if table is None or len(table.rows) == 0:
                 continue
 
-            # find first non-empty row to infer n_cols
+            # find the first non-empty row to infer column count
             first_row = next((r for r in table.rows if getattr(r, "cells", None) and len(r.cells) > 0), None)
             if first_row is None:
                 continue
             n_cols = len(first_row.cells)
 
-            # header heuristic
+            # infer if first row is a header
             header_cells = table.rows[0].cells if len(table.rows[0].cells) > 0 else []
             headers = [_to_text(c.text) for c in header_cells] if header_cells else []
             has_header = any([
@@ -2444,24 +2711,11 @@ def find_pi_in_docx(docx_file) -> List[Dict[str, Any]]:
                         value=rec["Detected Value"],
                         confidence=rec["Confidence (%)"],
                     )
-                # Standalone PII for this table row
+                # standalone PII for this table row
                 _detect_standalone_pii(line, file_name, f"Table {t_idx}", f"Row {r_idx + 1}", records, seen)
 
-            # Whole-table pair detection: name and email/DOB may be in different rows.
-            # Join all rows into one block so cross-row pairs are found.
-            if len(all_row_lines_docx) > 1:
-                whole_table_text = " | ".join(all_row_lines_docx)
-                for rec in emit_grouped_records(file_name, f"Table {t_idx}", "", whole_table_text, pair_only=True):
-                    _add_record(records, seen,
-                        file_name=rec["File"],
-                        page_sheet=rec["Page/Sheet"],
-                        cell=rec["Cell"],
-                        pi_type=rec["PI Type"],
-                        value=rec["Detected Value"],
-                        confidence=rec["Confidence (%)"],
-                    )
-
-            # NOTE: no per-cell fallback in DOCX tables  that's what produced Person Name / Phone / SSN rows.
+            # No per-cell fallback in DOCX tables.
+            # Whole-table cross-row pairing is disabled to avoid cross-person pairings in contact tables.
 
         except Exception as e:
             import traceback; traceback.print_exc()
@@ -2470,12 +2724,9 @@ def find_pi_in_docx(docx_file) -> List[Dict[str, Any]]:
 
     return records
 
-# MASTER DETECTOR  combines per-type scanners
+# Master detector — combines per-type scanners
 def detect_pi(files: List[Any]) -> pd.DataFrame:
-    """
-    Scan a list of uploaded files and return a combined DataFrame of detected PII.
-    Supports: PDF, DOCX, XLSX/XLS.
-    """
+    """Scan a list of uploaded files and return a combined DataFrame of detected PII. Supports PDF, DOCX, and XLSX/XLS."""
     supported_ext = {"pdf", "docx", "xlsx", "xls"}
     all_records: List[Dict[str, Any]] = []
 
@@ -2497,22 +2748,9 @@ def detect_pi(files: List[Any]) -> pd.DataFrame:
 
     return pd.DataFrame(all_records, columns=["File", "Page/Sheet", "Cell", "PI Type", "Detected Value", "Confidence (%)"])
 
-# REDACTION SUPPORT (Excel only)
+# Redaction support
 def load_pi_mapping(pi_df: pd.DataFrame, selected_pi_types: List[str]) -> Dict[str, List[str]]:
-    """
-    Build mapping: {file_name: [individual_values_to_redact]}.
-
-    Key rules:
-    1. Pair values like "Michael Brown, 1957-02-10" are split into components
-       so each part is searched independently in the document.
-    2. When ANY pair type is selected for redaction, we extract the NAME
-       component from ALL pair rows in the report — not just the selected type.
-       This ensures Lucas Rodriguez gets redacted even if only Name+DOB was
-       selected (since he only appears in a Name+Email pair).
-    3. Non-pair types are passed through as-is.
-    4. Multi-word names (e.g. "Michael Brown") also add individual word components
-       so FirstName/LastName cells in Excel are redacted too.
-    """
+    """Build a {file_name: [values_to_redact]} mapping. Pair values are split into components, and name words are added individually so FirstName/LastName cells are also caught."""
     if pi_df is None or pi_df.empty:
         return {}
     required_cols = ["File", "Detected Value", "PI Type"]
@@ -2521,11 +2759,12 @@ def load_pi_mapping(pi_df: pd.DataFrame, selected_pi_types: List[str]) -> Dict[s
             raise ValueError(f"PI DataFrame must contain '{col}' column")
 
     ALL_PAIR_TYPES = {"Name, email", "Name, Date of Birth", "Name, Company ID",
-                      "Name, Email", "Name, DOB"}
+                      "Name, Phone", "Name, Address", "Name, City", "Name, State",
+                      "Name, Gender", "Name, Email", "Name, DOB"}
 
-    # Check if user is redacting any name-related pair type
+    # check if any name-related pair type was selected
     redacting_names = bool(set(selected_pi_types) & ALL_PAIR_TYPES)
-    # Also treat standalone Person Name as triggering name redaction
+    # standalone Person Name also triggers name redaction
     if "Person Name" in selected_pi_types:
         redacting_names = True
 
@@ -2537,7 +2776,7 @@ def load_pi_mapping(pi_df: pd.DataFrame, selected_pi_types: List[str]) -> Dict[s
             mapping.setdefault(fname, []).append(val)
 
     def _add_name_with_parts(fname: str, full_name: str) -> None:
-        """Add the full name AND each word component (for FirstName/LastName cells)."""
+        """Add the full name and each word component so FirstName/LastName cells are also redacted."""
         full_name = full_name.strip()
         if not full_name:
             return
@@ -2556,10 +2795,10 @@ def load_pi_mapping(pi_df: pd.DataFrame, selected_pi_types: List[str]) -> Dict[s
 
         if pi_type in ALL_PAIR_TYPES:
             parts = [p.strip() for p in val.split(", ", 1)]
-            # First part is always the name  add with word components
+            # first part is always the name
             if parts:
                 _add_name_with_parts(fname, parts[0])
-            # Second part (email/DOB/ID)  add as-is
+            # second part (email/DOB/ID) — add as-is
             if len(parts) > 1:
                 _add(fname, parts[1])
         elif pi_type == "Person Name":
@@ -2567,7 +2806,7 @@ def load_pi_mapping(pi_df: pd.DataFrame, selected_pi_types: List[str]) -> Dict[s
         else:
             _add(fname, val)
 
-    # pair rows (regardless of pair type) so no name is missed.
+    # scan all pair rows so no name is missed
     if redacting_names:
         df_all_pairs = pi_df[pi_df['PI Type'].isin(ALL_PAIR_TYPES)].dropna(subset=["File", "Detected Value"])
         for _, row in df_all_pairs.iterrows():
@@ -2575,7 +2814,7 @@ def load_pi_mapping(pi_df: pd.DataFrame, selected_pi_types: List[str]) -> Dict[s
             val   = str(row["Detected Value"]).strip()
             name_part = val.split(", ", 1)[0].strip()
             _add_name_with_parts(fname, name_part)
-        # Also include standalone Person Name rows
+        # also include standalone Person Name rows
         df_pn = pi_df[pi_df['PI Type'] == "Person Name"].dropna(subset=["File", "Detected Value"])
         for _, row in df_pn.iterrows():
             fname = str(row["File"]).strip()
@@ -2593,22 +2832,14 @@ def load_pi_mapping(pi_df: pd.DataFrame, selected_pi_types: List[str]) -> Dict[s
     return mapping
 
 def redact_excel_bytesio(excel_bytes: bytes, pi_values: List[str]) -> BytesIO:
-    """
-    Redact PII from an Excel file.
-    Handles:
-    - String cells: direct text replacement
-    - Date cells: compares in multiple formats (ISO, MM/DD/YYYY, DD/MM/YYYY)
-      since detected value may be ISO (2003-08-29) but cell stores 08/29/2003
-    - Numeric cells: converts to string for comparison
-    """
+    """Redact PII from an Excel file. Handles string, date (multiple formats), and numeric cells."""
     excel_stream = BytesIO(excel_bytes)
     excel_stream.seek(0)
     wb = openpyxl.load_workbook(excel_stream)
 
     pi_values_sorted = sorted(set(v for v in pi_values if v), key=len, reverse=True)
 
-    # Pre-build alternate date formats for each ISO date in pi_values
-    # so "2003-08-29" also matches "08/29/2003", "29/08/2003", "2003/08/29"
+    # Pre-build alternate date formats so ISO dates also match other common formats
     date_alternates: Dict[str, List[str]] = {}
     for pi in pi_values_sorted:
         m = re.match(r'^(\d{4})-(\d{2})-(\d{2})$', pi)
@@ -2623,13 +2854,17 @@ def redact_excel_bytesio(excel_bytes: bytes, pi_values: List[str]) -> BytesIO:
             ]
 
     def _cell_matches_pi(cell_str: str, pi: str) -> bool:
+        # for short values (e.g. state codes), require a word boundary to avoid false matches
+        if len(pi) <= 3 and pi.isalpha():
+            import re as _re
+            if not _re.search(r'(?<![A-Za-z0-9])' + _re.escape(pi) + r'(?![A-Za-z0-9])', cell_str, _re.IGNORECASE):
+                return False
+            return True
         if pi in cell_str:
             return True
-        # Check date alternates (handles format mismatches ISO↔MM/DD/YYYY etc.)
         for alt in date_alternates.get(pi, []):
             if alt in cell_str:
                 return True
-        # Case-insensitive match for names
         if pi.lower() in cell_str.lower():
             return True
         return False
@@ -2638,24 +2873,27 @@ def redact_excel_bytesio(excel_bytes: bytes, pi_values: List[str]) -> BytesIO:
         ws = wb[sheet]
         for row in ws.iter_rows():
             for cell in row:
-                # Handle string cells
+                # string cells
                 if isinstance(cell.value, str) and cell.value:
                     text = cell.value
                     changed = False
                     for pi in pi_values_sorted:
                         if _cell_matches_pi(text, pi):
-                            # Replace all alternate forms too
+                            # case-insensitive replace for all forms
+                            import re as _re_cell
                             for alt in [pi] + date_alternates.get(pi, []):
-                                text = text.replace(alt, "[REDACTED]")
-                            changed = True
+                                new_text = _re_cell.sub(_re_cell.escape(alt), "[REDACTED]", text, flags=_re_cell.IGNORECASE)
+                                if new_text != text:
+                                    text = new_text
+                                    changed = True
                     if changed:
                         cell.value = text
 
-                # Handle date/datetime cells
+                # date/datetime cells
                 elif hasattr(cell.value, 'strftime'):
                     cell_date = cell.value
                     for pi in pi_values_sorted:
-                        # Check ISO format match
+                        # check ISO format
                         try:
                             iso = cell_date.strftime('%Y-%m-%d')
                             if iso == pi or pi in date_alternates and any(
@@ -2668,7 +2906,7 @@ def redact_excel_bytesio(excel_bytes: bytes, pi_values: List[str]) -> BytesIO:
                         except Exception:
                             pass
 
-                # Handle numeric cells (e.g. account numbers stored as numbers)
+                # numeric cells (e.g. account numbers stored as numbers)
                 elif cell.value is not None and not isinstance(cell.value, bool):
                     cell_str = str(cell.value)
                     for pi in pi_values_sorted:
@@ -2682,10 +2920,7 @@ def redact_excel_bytesio(excel_bytes: bytes, pi_values: List[str]) -> BytesIO:
     return out
 
 def safe_redact(text: str, value: str) -> str:
-    """
-    Case-insensitive regex-based redaction. More robust than plain str.replace()
-    — handles spacing differences, OCR noise, and formatting variants.
-    """
+    """Case-insensitive regex redaction. More robust than plain str.replace() — handles spacing and formatting variants."""
     if not value or not text:
         return text
     pattern = re.escape(value)
@@ -2693,15 +2928,13 @@ def safe_redact(text: str, value: str) -> str:
 
 
 def redact_docx_bytesio(docx_bytes: bytes, pi_values: List[str]) -> BytesIO:
-    """
-    Redact PII from a DOCX. Handles ISO↔DD/MM/YYYY date format mismatch.
-    """
+    """Redact PII from a DOCX, handling ISO vs DD/MM/YYYY date format differences."""
     import re as _re
     stream = BytesIO(docx_bytes); stream.seek(0)
     doc = Document(stream)
     pi_sorted = sorted(set(v for v in pi_values if v), key=len, reverse=True)
 
-    # Build alternate date forms: "1990-08-15" → ["15/08/1990", "08/15/1990", ...]
+    # Build alternate date forms so ISO dates match other common formats
     _date_alts: Dict[str, List[str]] = {}
     for pi in pi_sorted:
         m = _re.match(r"^(\d{4})-(\d{2})-(\d{2})$", pi)
@@ -2717,8 +2950,14 @@ def redact_docx_bytesio(docx_bytes: bytes, pi_values: List[str]) -> BytesIO:
         replaced = full
         for pi in pi_sorted:
             for form in _all_forms(pi):
-                if form in replaced:
-                    replaced = replaced.replace(form, "[REDACTED]")
+                escaped = _re.escape(form)
+                # word boundaries for short alpha values (state codes, gender words) to prevent false matches
+                if _re.fullmatch(r"[A-Za-z]{1,5}", form):
+                    pattern = r"\b" + escaped + r"\b"
+                else:
+                    pattern = escaped
+                if _re.search(pattern, replaced, _re.IGNORECASE):
+                    replaced = _re.sub(pattern, "[REDACTED]", replaced, flags=_re.IGNORECASE)
         if replaced != full and para.runs:
             para.runs[0].text = replaced
             for r in para.runs[1:]: r.text = ""
@@ -2741,7 +2980,6 @@ except Exception:
 
 def _get_local_fontsize(page, rect, default: float = 11.0) -> float:
     """Return the font size of the nearest non-redacted text span to rect."""
-    """Return the font size of the nearest non-redacted text span to rect."""
     best, dist = default, float("inf")
     for b in page.get_text("dict")["blocks"]:
         for line in b.get("lines", []):
@@ -2759,11 +2997,7 @@ def _get_local_fontsize(page, rect, default: float = 11.0) -> float:
 
 
 def redact_pdf_bytesio(pdf_bytes: bytes, pi_values: List[str]) -> BytesIO:
-    """
-    Redact PII from a PDF using PyMuPDF.
-    Draws SOLID BLACK rectangles only — no text overlay, no white background.
-    Also searches alternate date formats (ISO ↔ DD/MM/YYYY) for full coverage.
-    """
+    """Redact PII from a PDF using PyMuPDF. Searches alternate date formats for full coverage."""
     try:
         import fitz
     except ImportError:
@@ -2771,19 +3005,24 @@ def redact_pdf_bytesio(pdf_bytes: bytes, pi_values: List[str]) -> BytesIO:
         out = BytesIO(pdf_bytes); out.seek(0); return out
 
     import re as _re
+    # sort longer values first to prevent 'male' matching inside 'female'
     pi_sorted = sorted(set(v for v in pi_values if v), key=len, reverse=True)
 
-    # Build alternate date forms so ISO "1990-08-15" also finds "15/08/1990" in PDF
+    # build alternate date forms so ISO dates match other formats in the PDF
     all_search_terms = []
     for pi in pi_sorted:
         all_search_terms.append(pi)
+        # add title-case and uppercase variants (PyMuPDF search is case-sensitive)
+        if pi.islower() and len(pi) <= 15:
+            all_search_terms.append(pi.title())
+            all_search_terms.append(pi.upper())
         m = _re.match(r"^(\d{4})-(\d{2})-(\d{2})$", pi)
         if m:
             y, mo, d = m.groups()
             all_search_terms += [f"{d}/{mo}/{y}", f"{mo}/{d}/{y}", f"{d}-{mo}-{y}",
                                   f"{y}/{mo}/{d}", f"{y}-{mo}-{d}"]
 
-    # Normalize search terms (collapse spaces around hyphens)
+    # normalize search terms
     normalized_terms = set()
     for term in all_search_terms:
         normalized_terms.add(term)
@@ -2791,7 +3030,7 @@ def redact_pdf_bytesio(pdf_bytes: bytes, pi_values: List[str]) -> BytesIO:
         if collapsed != term:
             normalized_terms.add(collapsed)
 
-    # For addresses: also search city/state/zip portions separately
+    # for addresses: also search city/state/ZIP portions separately
     address_extras = set()
     for term in list(normalized_terms):
         if ',' in term:
@@ -2805,49 +3044,50 @@ def redact_pdf_bytesio(pdf_bytes: bytes, pi_values: List[str]) -> BytesIO:
                         address_extras.add(pin.group(0))
     normalized_terms.update(address_extras)
 
-    # For table-split values: PDF tables often break "253-75-9741" across two lines
-    ## as "253-75-" and "9741". Add the hyphen-prefix fragment so we can find both
+    # PDF tables sometimes break values across lines — add split fragments so we can find both parts
     split_fragments = set()
     for term in list(normalized_terms):
-        # SSN: NNN-NN-NNNN → search "NNN-NN-" and "NNNN"
+        # SSN split fragments
         m_ssn = _re.match(r'^(\d{3}-\d{2}-)(\d{4})$', term)
         if m_ssn:
             split_fragments.add(m_ssn.group(1))   # "253-75-"
             split_fragments.add(m_ssn.group(2))   # "9741"
-        # ISO date: YYYY-MM-DD → search "YYYY-" and "MM-DD"
+        # ISO date split fragments
         m_iso = _re.match(r'^(\d{4}-)(\d{2}-\d{2})$', term)
         if m_iso:
             split_fragments.add(m_iso.group(1))   # "1966-"
             split_fragments.add(m_iso.group(2))   # "09-10"
-        # Date with slash: already full; also add "YYYY/" prefix
+        # date with slash — also add YYYY/ prefix
         m_yslash = _re.match(r'^(\d{4}/)(\d{2}/\d{2})$', term)
         if m_yslash:
             split_fragments.add(m_yslash.group(1))
             split_fragments.add(m_yslash.group(2))
-        # Phone: (NNN) NNN-NNNN → search "(NNN)" and "NNN-"
+        # phone split fragments
         m_phone = _re.match(r'^(\(\d{3}\))\s*(\d{3}-)(\d{4})$', term)
         if m_phone:
             split_fragments.add(m_phone.group(1))         # "(408)"
             split_fragments.add(m_phone.group(2))         # "321-"
             split_fragments.add(m_phone.group(3))         # "9136"
             split_fragments.add(m_phone.group(2) + m_phone.group(3))  # "321-9136"
-        ## Voter ID / MRN partial (alphanumeric that can split mid-word): skip (too
-    ## Only add fragments that are long enough to be specific (≥6 chars to avoid
+        # Voter ID / MRN: skip — too ambiguous as fragments
+    # only add fragments ≥6 chars to keep them specific
     normalized_terms.update(f for f in split_fragments if len(f) >= 6)
 
     all_search_terms = sorted(normalized_terms, key=len, reverse=True)
 
-    # Separate full-value terms (longer, more specific) from short fragment terms
-    # Fragments are only used when the full value wasn't found on that page
+    # Separate full, fragment, and short word terms.
+    # Short terms (≤5 chars like 'male', 'TX') are searched with word boundaries to avoid false matches.
     _FRAGMENT_MIN_LEN = 6
-    full_terms = [t for t in all_search_terms if len(t) >= 8]
-    frag_terms = [t for t in all_search_terms if len(t) < 8 and len(t) >= _FRAGMENT_MIN_LEN]
+    full_terms  = [t for t in all_search_terms if len(t) >= 8]
+    frag_terms  = [t for t in all_search_terms if len(t) < 8 and len(t) >= _FRAGMENT_MIN_LEN]
+    # Short alpha-only terms that must match as whole words (gender values, state codes, etc.)
+    short_word_terms = [t for t in all_search_terms if len(t) < _FRAGMENT_MIN_LEN and t.isalpha()]
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     for page in doc:
-        # Collect all match rects across all search terms
+        # collect all match rects
         raw_rects: list = []
-        # First pass: full-value terms (always search)
+        # first pass: full-value terms
         found_full_terms: set = set()
         for term in full_terms:
             hits = page.search_for(term)
@@ -2855,19 +3095,29 @@ def redact_pdf_bytesio(pdf_bytes: bytes, pi_values: List[str]) -> BytesIO:
                 found_full_terms.add(term)
                 for rect in hits:
                     raw_rects.append(fitz.Rect(rect))
-        # Second pass: fragment terms  only when no full-value hit covers this value
-        # This prevents short fragments like '321-' from matching random text
+        # second pass: fragment terms — only when no full-value hit already covers it
         for term in frag_terms:
             # Skip if a longer term that contains this fragment was already found
             if any(term in ft for ft in found_full_terms):
                 continue
             for rect in page.search_for(term):
                 raw_rects.append(fitz.Rect(rect))
+        # third pass: short whole-word terms matched via word boundaries (PyMuPDF has no built-in word-boundary search)
+        if short_word_terms:
+            _short_pattern = _re.compile(
+                r"(?<![A-Za-z])(?:" + "|".join(_re.escape(t) for t in short_word_terms) + r")(?![A-Za-z])",
+                _re.IGNORECASE,
+            )
+            _page_words = page.get_text("words")  # list of (x0,y0,x1,y1,word,block,line,word_idx)
+            for _w in _page_words:
+                _word_text = _w[4]
+                if _short_pattern.fullmatch(_word_text.strip()):
+                    raw_rects.append(fitz.Rect(_w[0], _w[1], _w[2], _w[3]))
 
         if not raw_rects:
             continue
 
-        # Sort by y0 then x0 (top-to-bottom, left-to-right)
+        # sort top-to-bottom, left-to-right
         raw_rects.sort(key=lambda r: (round(r.y0, 1), r.x0))
 
         def _same_line(a, b, tol=4.0):
@@ -2876,7 +3126,7 @@ def redact_pdf_bytesio(pdf_bytes: bytes, pi_values: List[str]) -> BytesIO:
         def _adjacent(a, b, gap=6.0):
             return _same_line(a, b) and a.x0 <= b.x1 + gap and b.x0 <= a.x1 + gap
 
-        # Merge overlapping/adjacent rects on the same line
+        # merge overlapping/adjacent rects on the same line
         merged: list = []
         for r in raw_rects:
             placed = False
@@ -2891,11 +3141,9 @@ def redact_pdf_bytesio(pdf_bytes: bytes, pi_values: List[str]) -> BytesIO:
             if not placed:
                 merged.append(fitz.Rect(r))
 
-        # Draw each merged rect with [REDACTED] label.
-        # Box height = surrounding text height (detected from nearby spans), capped so
-        # boxes never overflow into adjacent lines.
+        # draw each merged rect with a [REDACTED] label sized to the surrounding text
         for rect in merged:
-            # Sample nearby font size so [REDACTED] visually matches the document.
+            # sample nearby font size so [REDACTED] matches the document
             nearby_sz = 10.0  # safe default
             try:
                 for blk in page.get_text("dict")["blocks"]:
@@ -2910,11 +3158,10 @@ def redact_pdf_bytesio(pdf_bytes: bytes, pi_values: List[str]) -> BytesIO:
             except Exception:
                 pass
 
-            # Build a rect that is exactly the height of one text line at nearby_sz.
-            # Width: whichever is larger  the matched text width or enough for "[REDACTED]".
+            # build a rect one text line high; wide enough to fit [REDACTED]
             line_h = nearby_sz * 1.25          # standard line height
             label = "[REDACTED]"
-            # Approximate char width at this size (Helvetica ~0.52 × size)
+            # approximate char width (Helvetica ~0.52 × size)
             label_w = len(label) * nearby_sz * 0.52
             box = fitz.Rect(
                 rect.x0,
@@ -2939,10 +3186,7 @@ def redact_pdf_bytesio(pdf_bytes: bytes, pi_values: List[str]) -> BytesIO:
     return out
 
 def process_source_files(source_files: List[Any], pi_dict: Dict[str, List[str]]) -> Dict[str, BytesIO]:
-    """
-    Redact PII from uploaded files. Supports Excel, DOCX, and PDF.
-    Returns {file_name: BytesIO} of redacted files.
-    """
+    """Redact PII from uploaded files (Excel, DOCX, PDF). Returns {file_name: BytesIO}."""
     redacted_output: Dict[str, BytesIO] = {}
     for f in source_files:
         fname = getattr(f, "name", "")
@@ -2977,7 +3221,7 @@ def to_excel(df: pd.DataFrame) -> bytes:
         df.to_excel(writer, index=False, sheet_name="PII Results")
     return output.getvalue()
 
-# DOB parsing/validation helpers
+# DOB parsing and validation
 def parse_multiple_dates(text: Any) -> List[datetime]:
     if pd.isna(text):
         return []
@@ -2985,14 +3229,14 @@ def parse_multiple_dates(text: Any) -> List[datetime]:
     parsed: List[datetime] = []
     for p in parts:
         dt = None
-        # Try ISO YYYY-MM-DD first (no ambiguity, dayfirst=False)
+        # try ISO YYYY-MM-DD first (unambiguous)
         import re as _re_date
         if _re_date.match(r"\d{4}-\d{2}-\d{2}", p.strip()):
             try:
                 dt = pd.to_datetime(p, dayfirst=False, errors="raise")
             except Exception:
                 pass
-        # Then try DD/MM/YYYY (Indian/European)
+        # then try DD/MM/YYYY
         if dt is None:
             try:
                 dt = pd.to_datetime(p, dayfirst=True, errors="raise")
@@ -3025,30 +3269,27 @@ def filter_valid_dobs(value: Any) -> Any:
         return [d for d in value if is_probable_dob(d)]
     return value
 
-# OCR for embedded images (PDF / DOCX / XLSX)
+# OCR for embedded images
 def ocr_pil_image(img: Image.Image) -> str:
-    """
-    OCR a PIL image with preprocessing tuned for document scans and ID cards.
-    Returns extracted text string.
-    """
-    # Convert to grayscale
+    """OCR a PIL image with preprocessing tuned for document scans. Returns extracted text."""
+    # convert to grayscale
     gray = img.convert("L")
 
-    ## Upscale small images for better OCR accuracy (Tesseract works best >= 300
+    # upscale small images for better accuracy (Tesseract works best at 300+ DPI)
     w, h = gray.size
     if w < 1500 or h < 1000:
         scale = max(2, 2400 // max(w, 1))
         gray = gray.resize((w * scale, h * scale), Image.LANCZOS)
 
-    # Slight sharpening to help with compressed/blurry scans
+    # slight sharpening for compressed/blurry scans
     gray = gray.filter(ImageFilter.SHARPEN)
 
-    ## Run Tesseract with --psm 6 (assume uniform block of text) for better line
+    # run Tesseract with --psm 6 (uniform block of text)
     custom_config = r"--oem 1 --psm 6"
     try:
         text = pytesseract.image_to_string(gray, config=custom_config).strip()
     except Exception:
-        # Fallback: plain call
+        # fallback: plain call
         text = pytesseract.image_to_string(gray).strip()
     return text
 
@@ -3056,7 +3297,7 @@ def extract_image_texts_from_pdf_pdfium(pdf_file, scale: float = 2.0) -> List[Di
     records: List[Dict[str, Any]] = []
     doc_name = Path(getattr(pdf_file, "name", "document.pdf")).name
 
-    #  Attempt 1: extract embedded image objects via pdfplumber 
+    # attempt 1: extract embedded image objects via pdfplumber
     try:
         try:
             pdf_file.seek(0)
@@ -3068,7 +3309,7 @@ def extract_image_texts_from_pdf_pdfium(pdf_file, scale: float = 2.0) -> List[Di
                 img_idx = 0
                 for img_info in page_images:
                     try:
-                        # Crop the page to the image bounding box and convert to PIL
+                        # crop to image bounding box and convert to PIL
                         x0 = img_info.get("x0", 0)
                         top = img_info.get("top", 0)
                         x1 = img_info.get("x1", page.width)
@@ -3091,7 +3332,7 @@ def extract_image_texts_from_pdf_pdfium(pdf_file, scale: float = 2.0) -> List[Di
     if records:
         return records
 
-    # Fallback: full-page render via pdfium (only when no image objects found)
+    # fallback: full-page render via pdfium (only when no image objects found)
     if pdfium is None:
         return records
     try:
@@ -3106,8 +3347,7 @@ def extract_image_texts_from_pdf_pdfium(pdf_file, scale: float = 2.0) -> List[Di
     n_pages = len(pdf)
     for i in range(n_pages):
         try:
-            # Skip OCR if PyPDF2 can already extract enough text from this page
-            # (avoids running OCR on text-layer PDFs which causes noise and duplication)
+            # skip OCR if the page already has extractable text
             _text_check = ""
             try:
                 pdf_file.seek(0)
@@ -3117,7 +3357,7 @@ def extract_image_texts_from_pdf_pdfium(pdf_file, scale: float = 2.0) -> List[Di
                     _text_check = _pr.pages[i].extract_text() or ""
             except Exception:
                 pass
-            # If page has 100+ chars of extractable text, it's a text-layer page  skip OCR
+            # if the page has 100+ chars of extractable text, it's a text-layer page — skip OCR
             if len(_text_check.strip()) >= 100:
                 continue
 
@@ -3144,7 +3384,7 @@ def extract_image_texts_from_docx(docx_file) -> List[Dict[str, Any]]:
     try:
         doc = Document(docx_file)
     except Exception:
-        # Fallback: save to temp and reopen
+        # fallback: save to a temp file and reopen
         with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
             shutil.copyfileobj(docx_file, tmp)
             tmp_path = tmp.name
@@ -3171,7 +3411,7 @@ def extract_image_texts_from_docx(docx_file) -> List[Dict[str, Any]]:
 
     return records
 
-# OOXML namespaces
+# OOXML namespaces for Excel XML parsing
 NS = {
     "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
     "xdr": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
@@ -3216,8 +3456,7 @@ def extract_image_texts_from_excel(xlsx_src) -> List[Dict[str, Any]]:
         rid_to_target = {}
         for rel in wb_rels.findall("rel:Relationship", NS):
             target = rel.get("Target", "")
-            # Normalise: absolute OOXML targets like '/xl/worksheets/sheet1.xml'
-            # must be resolved relative to the zip root, not joined with 'xl/'.
+            # absolute OOXML targets must be resolved from the zip root, not joined with 'xl/'
             if target.startswith("/"):
                 resolved = posixpath.normpath(target.lstrip("/"))
             else:
@@ -3293,7 +3532,7 @@ def extract_image_texts_from_excel(xlsx_src) -> List[Dict[str, Any]]:
 
     return records
 
-# Master image-text OCR aggregator
+# Master OCR aggregator for image text
 def extract_image_texts(file_paths: List[Any], pdf_scale: float = 2.0) -> pd.DataFrame:
     all_records: List[Dict[str, Any]] = []
     for f in file_paths:
@@ -3307,20 +3546,16 @@ def extract_image_texts(file_paths: List[Any], pdf_scale: float = 2.0) -> pd.Dat
             elif ext in {"xlsx", "xls"}:
                 all_records.extend(extract_image_texts_from_excel(f))
             else:
-                # skip unsupported
-                pass
+                pass  # skip unsupported
         except Exception as e:
             print(f"✖ Error processing in extract_image_texts for {name}: {e}")
 
     return pd.DataFrame(all_records, columns=["doc_name", "page_or_sheet", "text"])
 
 
-# Detect PII from OCR DataFrame (images)
+# Detect PII from OCR output
 def detect_pi_from_textframe(text_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Accepts DataFrame with columns ['doc_name', 'page_or_sheet', 'text'] (OCR output),
-    returns PII detections in the same canonical format as other scanners.
-    """
+    """Accepts a DataFrame with OCR output (doc_name, page_or_sheet, text) and returns PII detections in the standard format."""
     required_cols = {"doc_name", "page_or_sheet", "text"}
     if not required_cols.issubset(text_df.columns):
         raise ValueError(f"text_df is missing required columns: {required_cols - set(text_df.columns)}")
@@ -3349,11 +3584,10 @@ def detect_pi_from_textframe(text_df: pd.DataFrame) -> pd.DataFrame:
         if not raw_text.strip():
             continue
 
-        # Improve OCR text quality: collapse fragmented lines into paragraphs
-        # OCR from image PDFs often splits mid-sentence; join short lines
+        # OCR from image PDFs often splits mid-sentence
         ocr_text = raw_text
 
-        # Split into logical chunks for pair detection
+        # split into logical chunks for pair detection
         chunks = []
         for blk in re.split(r"(?:\n\s*\n)+|(?:^|\n)\s*#{1,6}\s.*?(?=\n|$)", ocr_text):
             b = (blk or "").strip()
@@ -3365,10 +3599,15 @@ def detect_pi_from_textframe(text_df: pd.DataFrame) -> pd.DataFrame:
             else:
                 chunks.append(b)
 
-        # STEP 1: Pair detection (Name+email, Name+DOB, Name+CompanyID) per chunk
+        # Step 1: pair detection per chunk
         pair_emails:   set = set()
         pair_names:    set = set()
         pair_dobs:     set = set()
+        pair_phones:   set = set()
+        pair_addrs:    set = set()
+        pair_cities:   set = set()
+        pair_states:   set = set()
+        pair_genders:  set = set()
 
         for i, blk in enumerate(chunks, 1):
             grouped = emit_grouped_records(file_name, f"{page_or_sheet}", cell_ref, blk, pair_only=True)
@@ -3381,28 +3620,33 @@ def detect_pi_from_textframe(text_df: pd.DataFrame) -> pd.DataFrame:
                     value=rec["Detected Value"],
                     confidence=rec["Confidence (%)"],
                 )
-                # Track what the pair consumed so we can suppress standalone duplicates
                 parts = str(rec["Detected Value"]).split(", ", 1)
                 name_part = parts[0].strip() if parts else ""
                 val_part  = parts[1].strip() if len(parts) > 1 else ""
+                pair_names.add(name_part.lower())
                 if rec["PI Type"] == "Name, email":
-                    pair_names.add(name_part.lower())
                     pair_emails.add(val_part.lower())
                 elif rec["PI Type"] == "Name, Date of Birth":
-                    pair_names.add(name_part.lower())
                     pair_dobs.add(val_part)
-                elif rec["PI Type"] == "Name, Company ID":
-                    pair_names.add(name_part.lower())
+                elif rec["PI Type"] == "Name, Phone":
+                    pair_phones.add(val_part)
+                elif rec["PI Type"] == "Name, Address":
+                    pair_addrs.add(val_part)
+                elif rec["PI Type"] == "Name, City":
+                    pair_cities.add(val_part.lower())
+                elif rec["PI Type"] == "Name, State":
+                    pair_states.add(val_part)
+                elif rec["PI Type"] == "Name, Gender":
+                    pair_genders.add(val_part.lower())
 
-        # STEP 2: All standalone PII on the full page text
-        # Use the full page text (not chunks) for better context in regex patterns
+        # Step 2: all standalone PII on the full page text
 
         # SSN
         for v in find_ssn_in_text(ocr_text):
             _add_record(records, seen, file_name=file_name, page_sheet=page_or_sheet,
                         cell=cell_ref, pi_type="SSN Number", value=v, confidence=100)
 
-        # Person names (suppress if already in a pair)
+        # person names (suppress if already in a pair)
         max_for_names = 10 if str(page_or_sheet).lower().startswith("pageimage") else 20
         for name in extract_person_names(ocr_text, max_names=max_for_names):
             if name.lower() not in pair_names:
@@ -3410,7 +3654,7 @@ def detect_pi_from_textframe(text_df: pd.DataFrame) -> pd.DataFrame:
                             cell=cell_ref, pi_type="Person Name", value=name,
                             confidence=95 if use_spacy else 85)
 
-        # Phone
+        # phone (suppress if already in a pair)
         for m in re.finditer(pi_PATTERNS["Phone"], ocr_text):
             v = m.group(0)
             s = m.start()
@@ -3420,17 +3664,19 @@ def detect_pi_from_textframe(text_df: pd.DataFrame) -> pd.DataFrame:
                 continue
             if '.' in v and re.search(r'\d+\.\d+\.\d+', v):
                 continue
+            if v in pair_phones:
+                continue
             _add_record(records, seen, file_name=file_name, page_sheet=page_or_sheet,
                         cell=cell_ref, pi_type="Phone", value=v, confidence=88)
 
-        # Email (suppress if already in a pair)
+        # email (suppress if already in a pair)
         for m in re.finditer(pi_PATTERNS["email"], ocr_text):
             v = m.group(0)
             if v.lower() not in pair_emails:
                 _add_record(records, seen, file_name=file_name, page_sheet=page_or_sheet,
                             cell=cell_ref, pi_type="email", value=v, confidence=100)
 
-        ## Date of Birth (suppress if already in a pair; filter non-plausible dates
+        # date of birth (suppress if already in a pair; filter non-plausible dates)
         dob_candidates: List[str] = []
         for cp in DOB_PATTERNS:
             dob_candidates.extend(m.group(0) for m in cp.finditer(ocr_text))
@@ -3438,7 +3684,7 @@ def detect_pi_from_textframe(text_df: pd.DataFrame) -> pd.DataFrame:
         for dv in dob_unique:
             if dv in pair_dobs:
                 continue
-            # Only emit if plausible as a birth date (age 1110); skips issue/expiry/future dates
+            # only emit if plausible as a birth date
             try:
                 import dateutil.parser as _dup
                 _parsed = _dup.parse(dv, dayfirst=False)
@@ -3449,7 +3695,7 @@ def detect_pi_from_textframe(text_df: pd.DataFrame) -> pd.DataFrame:
             _add_record(records, seen, file_name=file_name, page_sheet=page_or_sheet,
                         cell=cell_ref, pi_type="Date of Birth", value=dv, confidence=90)
 
-        # Credit/Debit Card (Luhn-validated)
+        # credit/debit card (Luhn-validated)
         for m in re.finditer(pi_PATTERNS["Credit/Debit Card"], ocr_text):
             v = m.group(0)
             if passes_luhn(v):
@@ -3461,7 +3707,7 @@ def detect_pi_from_textframe(text_df: pd.DataFrame) -> pd.DataFrame:
             _add_record(records, seen, file_name=file_name, page_sheet=page_or_sheet,
                         cell=cell_ref, pi_type="IP Address", value=m.group(0), confidence=95)
 
-        # US Passport  requires "Passport" keyword nearby
+        # US Passport — requires a passport keyword nearby
         for m in re.finditer(pi_PATTERNS["US Passport Number"], ocr_text):
             v = m.group(0).strip()
             if re.match(r"^[A-Z]\d{8}$", v) or PASSPORT_9D_RE.match(v):
@@ -3469,7 +3715,7 @@ def detect_pi_from_textframe(text_df: pd.DataFrame) -> pd.DataFrame:
                     _add_record(records, seen, file_name=file_name, page_sheet=page_or_sheet,
                                 cell=cell_ref, pi_type="US Passport Number", value=v, confidence=95)
 
-        # Driving License (context-gated)
+        # driving license (context-gated)
         for state, full_value, _ in iter_dl_matches(ocr_text, col_name=None, require_context=True):
             _add_record(records, seen, file_name=file_name, page_sheet=page_or_sheet,
                         cell=cell_ref, pi_type=f"Driving License ({state})", value=full_value, confidence=95)
@@ -3507,7 +3753,7 @@ def detect_pi_from_textframe(text_df: pd.DataFrame) -> pd.DataFrame:
                                 cell=cell_ref, pi_type="Account Number", value=v,
                                 confidence=90 if len(digits) >= 12 else 80)
 
-        # MRN (medical keyword required)
+        # MRN — medical keyword required
         for m in MRN_RE.finditer(ocr_text):
             if _has_mrn_context(ocr_text):
                 _add_record(records, seen, file_name=file_name, page_sheet=page_or_sheet,
@@ -3516,7 +3762,7 @@ def detect_pi_from_textframe(text_df: pd.DataFrame) -> pd.DataFrame:
         # Insurance ID
         for m in INSURANCE_ID_RE.finditer(ocr_text):
             _add_record(records, seen, file_name=file_name, page_sheet=page_or_sheet,
-                        cell=cell_ref, pi_type="Insurance ID", value=m.group(1), confidence=88)
+                        cell=cell_ref, pi_type="Insurance ID", value=m.group(1) or m.group(2) or "", confidence=88)
 
         # Aadhaar
         for m in re.finditer(pi_PATTERNS["Aadhaar Number"], ocr_text):
@@ -3528,13 +3774,12 @@ def detect_pi_from_textframe(text_df: pd.DataFrame) -> pd.DataFrame:
             _add_record(records, seen, file_name=file_name, page_sheet=page_or_sheet,
                         cell=cell_ref, pi_type="PAN Card", value=m.group(0), confidence=98)
 
-        # Company ID (alphanumeric IDs not already in a pair)
-        ## Suppress if the ID is already embedded inside a detected DL value (e.g.
+        # Company ID — skip IDs already captured inside a DL value
         detected_dl_values = {r["Detected Value"] for r in records
                               if r.get("PI Type","").startswith("Driving License") and r.get("File")==file_name}
         for cid in compiled_company_id.findall(ocr_text):
             if any(cid in dl_val for dl_val in detected_dl_values):
-                continue  # already captured as DL core
+                continue  # already part of a DL value
             _add_record(records, seen, file_name=file_name, page_sheet=page_or_sheet,
                         cell=cell_ref, pi_type="Company ID", value=cid, confidence=90)
 
@@ -3546,15 +3791,11 @@ def detect_pi_from_textframe(text_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(records, columns=["File", "Page/Sheet", "Cell", "PI Type", "Detected Value", "Confidence (%)"])
 
 def clean_pi_data(pi_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    De-duplicate, standardize, and keep plausible DOB values.
-    Confidence filter: rows below 40% confidence are treated as noise and dropped.
-    This removes Account Numbers without banking context, weak passports etc.
-    """
+    """Deduplicate and standardize results. Drops rows below 40% confidence (weak passports, account numbers without context, etc.)."""
     if pi_df is None or pi_df.empty:
         return pi_df
 
-    # Normalize column name capitalization if needed
+    # normalize column name capitalization
     cols = {c: c.strip() for c in pi_df.columns}
     pi_df = pi_df.rename(columns=cols)
     if "PI Type" not in pi_df.columns and "pi Type" in pi_df.columns:
@@ -3563,10 +3804,10 @@ def clean_pi_data(pi_df: pd.DataFrame) -> pd.DataFrame:
     df = pi_df.dropna(subset=["Detected Value"]).copy()
     df.drop_duplicates(inplace=True)
 
-    # Drop low confidence noise before grouping
+    # drop low-confidence rows before grouping
     if "Confidence (%)" in df.columns:
         df = df[df["Confidence (%)"] >= 40].copy()
-    # Remove non-PII helper types 
+    # remove internal helper types
     df = df[~df["PI Type"].isin(["City_SKIP"])].copy() if "PI Type" in df.columns else df
 
     if df.empty:
@@ -3596,7 +3837,7 @@ def clean_pi_data(pi_df: pd.DataFrame) -> pd.DataFrame:
     if dob_mask.any():
         parsed = grouped.loc[dob_mask, "Detected Value"].apply(parse_multiple_dates)
         valid = parsed.apply(filter_valid_dobs)
-        # Drop rows with no valid DOB remaining
+        # drop rows with no valid DOB remaining
         keep_mask = valid.apply(lambda x: isinstance(x, list) and len(x) > 0)
         grouped = pd.concat(
             [grouped.loc[~dob_mask], grouped.loc[dob_mask].loc[keep_mask].assign(**{
@@ -3605,10 +3846,10 @@ def clean_pi_data(pi_df: pd.DataFrame) -> pd.DataFrame:
             ignore_index=True
         )
 
-    # Ensure not empty strings
+    # drop empty detected values
     grouped = grouped[grouped["Detected Value"].astype(str).str.strip() != ""]
 
-    # Drop single-word Person Name values  last-name-only FPs like "Brown", "Alexander"
+    # drop single-word Person Name values (last-name-only false positives)
     if "Person Name" in grouped["PI Type"].values:
         grouped = grouped[~(
             (grouped["PI Type"] == "Person Name") &
@@ -3617,13 +3858,13 @@ def clean_pi_data(pi_df: pd.DataFrame) -> pd.DataFrame:
             )
         )].copy()
 
-    # For Address type: drop any value that is a substring of another Address value
+    # Address: drop substrings of longer address values
     if "Address" in grouped["PI Type"].values:
         addr_vals = grouped[grouped["PI Type"] == "Address"]["Detected Value"].tolist()
         addr_vals_sorted = sorted(addr_vals, key=len, reverse=True)  # longest first
         keep = []
         for val in addr_vals_sorted:
-            # Keep if not a substring of any already-kept (longer) address
+            # keep if not a substring of an already-kept longer address
             if not any(str(val) in str(longer) and str(val) != str(longer) for longer in keep):
                 keep.append(val)
         keep_set = set(keep)
@@ -3640,7 +3881,7 @@ def clean_pi_data(pi_df: pd.DataFrame) -> pd.DataFrame:
     grouped = grouped.sort_values(by=["PI Type", "_para_num", "Detected Value"]).drop(columns=["_para_num"])
     grouped = grouped.reset_index(drop=True)
 
-    # If same 10-digit number appears in both "Indian Phone" and "Account Number",
+    # if the same 10-digit number appears as both Indian Phone and Account Number, prefer Account Number
     if "Indian Phone" in grouped["PI Type"].values and "Account Number" in grouped["PI Type"].values:
         acct_digits = set(
             re.sub(r"\D", "", str(v))
@@ -3651,7 +3892,7 @@ def clean_pi_data(pi_df: pd.DataFrame) -> pd.DataFrame:
             grouped["Detected Value"].apply(lambda v: re.sub(r"\D", "", str(v)) in acct_digits)
         )].copy()
 
-    # Drop Indian Phone if the same number already flagged as Account Number 
+    # remove duplicate (the block above handles this already)
     if "Indian Phone" in grouped["PI Type"].values and "Account Number" in grouped["PI Type"].values:
         acct_digits = set(
             re.sub(r"\D", "", str(v))
@@ -3662,7 +3903,7 @@ def clean_pi_data(pi_df: pd.DataFrame) -> pd.DataFrame:
             grouped["Detected Value"].apply(lambda v: re.sub(r"\D", "", str(v)) in acct_digits)
         )].copy()
 
-    # If same 10-digit number appears in both "Indian Phone" and "Phone",
+    # if the same number appears as both Indian Phone and Phone, keep only Indian Phone
     if "Indian Phone" in grouped["PI Type"].values and "Phone" in grouped["PI Type"].values:
         import re as _re
         indian_last10 = set(
@@ -3679,8 +3920,7 @@ def clean_pi_data(pi_df: pd.DataFrame) -> pd.DataFrame:
 
 
     if "PI Type" in grouped.columns:
-        ## Drop standalone email if the SAME email already appears as part of a
-        # (global across the whole file  not per-page)
+        # drop standalone email if it already appears in a Name+email pair
         pair_email_keys: set = set()
         for _, r in grouped[grouped["PI Type"] == "Name, email"].iterrows():
             parts = str(r["Detected Value"]).split(", ", 1)
@@ -3694,13 +3934,14 @@ def clean_pi_data(pi_df: pd.DataFrame) -> pd.DataFrame:
         grouped = grouped[~mask_dup].copy()
 
     if "PI Type" in grouped.columns and "Person Name" in grouped["PI Type"].values:
-        _ALL_PAIR_TYPES = {"Name, email", "Name, Date of Birth", "Name, Company ID"}
+        _ALL_PAIR_TYPES = {"Name, email", "Name, Date of Birth", "Name, Company ID",
+                           "Name, Phone", "Name, Address", "Name, City", "Name, State", "Name, Gender"}
         _pair_name_keys: set = set()
-        _pair_name_words: set = set()  # individual words of all paired full names
+        _pair_name_words: set = set()  # individual words from paired full names
         for _, _r in grouped[grouped["PI Type"].isin(_ALL_PAIR_TYPES)].iterrows():
             _name_part = str(_r["Detected Value"]).split(", ", 1)[0].strip()
             _pair_name_keys.add(str(_r["File"]) + "|" + _name_part.lower())
-            # Add each word of the full name (e.g. "Michael", "Brown" from "Michael Brown")
+            # add each word of the full name
             for _w in _name_part.split():
                 _pair_name_words.add(str(_r["File"]) + "|" + _w.lower())
 
@@ -3709,7 +3950,7 @@ def clean_pi_data(pi_df: pd.DataFrame) -> pd.DataFrame:
                 return False
             val = str(r["Detected Value"]).strip()
             file_key = str(r["File"])
-            # Exact match (case-insensitive)
+            # exact match (case-insensitive)
             if file_key + "|" + val.lower() in _pair_name_keys:
                 return True
             # Single-word first/last name that is a word in any paired full name
@@ -3733,7 +3974,129 @@ def clean_pi_data(pi_df: pd.DataFrame) -> pd.DataFrame:
             )
         )].copy()
 
-    # Drop Phone values that look like IP address fragments (contain dots with digits)
+    # suppress standalone Phone if already in a Name,Phone pair
+    if "PI Type" in grouped.columns:
+        _pair_phone_keys: set = set()
+        for _, _r in grouped[grouped["PI Type"] == "Name, Phone"].iterrows():
+            _p = str(_r["Detected Value"]).split(", ", 1)
+            if len(_p) == 2:
+                _pair_phone_keys.add((str(_r["File"]), _p[1].strip()))
+        for _pt in ("Phone", "Indian Phone"):
+            grouped = grouped[~(
+                (grouped["PI Type"] == _pt) &
+                grouped.apply(
+                    lambda r: (str(r["File"]), str(r["Detected Value"]).strip()) in _pair_phone_keys,
+                    axis=1,
+                )
+            )].copy()
+
+    # suppress standalone Address if already in a Name,Address pair, including city/state/ZIP fragments
+    if "PI Type" in grouped.columns:
+        _pair_addr_vals: set = set()
+        _pair_addr_files: set = set()
+        for _, _r in grouped[grouped["PI Type"] == "Name, Address"].iterrows():
+            _a = str(_r["Detected Value"]).split(", ", 1)
+            if len(_a) == 2:
+                _pair_addr_vals.add((str(_r["File"]), _a[1].strip()))
+                _pair_addr_files.add(str(_r["File"]))
+        # pattern for city/state/zip fragments without a street number
+        _city_state_frag_re = re.compile(
+            r"^[A-Za-z][A-Za-z\s]+,\s*[A-Z]{2}\s+\d{5,6}$|"  # City, ST ZIPCODE
+            r"^[A-Za-z][A-Za-z\s]+\s+\d{5,6}$|"               # City ZIPCODE (Indian style)
+            r"^(?:Floor|Suite|Apt|Unit|Flat)\s+\S+"             # Floor 3 / Suite 755 alone
+        )
+        def _addr_covered(r):
+            if r["PI Type"] != "Address":
+                return False
+            rv = str(r["Detected Value"]).strip()
+            fk = str(r["File"])
+            # exact match in pair addresses
+            if (fk, rv) in _pair_addr_vals:
+                return True
+            # also suppress if it's a sub-fragment of a paired address
+            if any(fk == pk and rv in pv for pk, pv in _pair_addr_vals):
+                return True
+            # city/state/zip fragments for files that already have a Name,Address pair
+            if fk in _pair_addr_files and _city_state_frag_re.match(rv):
+                return True
+            return False
+        grouped = grouped[~grouped.apply(_addr_covered, axis=1)].copy()
+
+    # suppress standalone City if already in a Name,City pair
+    if "PI Type" in grouped.columns and "City" in grouped["PI Type"].values:
+        _pair_city_keys: set = set()
+        for _, _r in grouped[grouped["PI Type"] == "Name, City"].iterrows():
+            _c = str(_r["Detected Value"]).split(", ", 1)
+            if len(_c) == 2:
+                _pair_city_keys.add((str(_r["File"]), _c[1].strip().lower()))
+        grouped = grouped[~(
+            (grouped["PI Type"] == "City") &
+            grouped.apply(
+                lambda r: (str(r["File"]), str(r["Detected Value"]).strip().lower()) in _pair_city_keys,
+                axis=1,
+            )
+        )].copy()
+
+    # suppress standalone State if already in a Name,State pair or inside a Name,Address value
+    if "PI Type" in grouped.columns and "State" in grouped["PI Type"].values:
+        _pair_state_keys: set = set()
+        for _, _r in grouped[grouped["PI Type"] == "Name, State"].iterrows():
+            _s = str(_r["Detected Value"]).split(", ", 1)
+            if len(_s) == 2:
+                _pair_state_keys.add((str(_r["File"]), _s[1].strip()))
+        # also collect state codes from Name,Address values
+        _addr_state_codes: set = set()
+        for _, _r in grouped[grouped["PI Type"] == "Name, Address"].iterrows():
+            _addr_val = str(_r["Detected Value"])
+            _fk = str(_r["File"])
+            import re as _re2
+            for _code in _re2.findall(r'\b([A-Z]{2})\b', _addr_val):
+                _addr_state_codes.add((_fk, _code))
+        def _state_covered(r):
+            if r["PI Type"] != "State":
+                return False
+            fk = str(r["File"])
+            sv = str(r["Detected Value"]).strip()
+            if (fk, sv) in _pair_state_keys:
+                return True
+            # handle comma-joined state codes like 'TN, CA'
+            for code in sv.replace(",", " ").split():
+                if (fk, code.strip()) in _addr_state_codes:
+                    return True
+            return False
+        grouped = grouped[~grouped.apply(_state_covered, axis=1)].copy()
+
+    # suppress standalone Company ID if already in a Name,Company ID pair
+    if "PI Type" in grouped.columns and "Company ID" in grouped["PI Type"].values:
+        _pair_cid_keys: set = set()
+        for _, _r in grouped[grouped["PI Type"] == "Name, Company ID"].iterrows():
+            _c = str(_r["Detected Value"]).split(", ", 1)
+            if len(_c) == 2:
+                _pair_cid_keys.add((str(_r["File"]), _c[1].strip()))
+        grouped = grouped[~(
+            (grouped["PI Type"] == "Company ID") &
+            grouped.apply(
+                lambda r: (str(r["File"]), str(r["Detected Value"]).strip()) in _pair_cid_keys,
+                axis=1,
+            )
+        )].copy()
+
+    # suppress standalone Gender if already in a Name,Gender pair
+    if "PI Type" in grouped.columns and "Gender" in grouped["PI Type"].values:
+        _pair_gender_keys: set = set()
+        for _, _r in grouped[grouped["PI Type"] == "Name, Gender"].iterrows():
+            _g = str(_r["Detected Value"]).split(", ", 1)
+            if len(_g) == 2:
+                _pair_gender_keys.add((str(_r["File"]), _g[1].strip().lower()))
+        grouped = grouped[~(
+            (grouped["PI Type"] == "Gender") &
+            grouped.apply(
+                lambda r: (str(r["File"]), str(r["Detected Value"]).strip().lower()) in _pair_gender_keys,
+                axis=1,
+            )
+        )].copy()
+
+    # drop Phone values that look like IP address fragments
     import re as _re_phone
     if "Phone" in grouped["PI Type"].values:
         grouped = grouped[~(
@@ -3755,7 +4118,7 @@ def clean_pi_data(pi_df: pd.DataFrame) -> pd.DataFrame:
             return len(d) >= 10 and d[-10:] in _ind_last10
         grouped = grouped[~grouped.apply(_is_dup_phone, axis=1)].copy()
 
-    # Drop Indian Phone if same number already flagged as Account Number
+    # drop Indian Phone if same number already flagged as Account Number
     if "Indian Phone" in grouped["PI Type"].values and "Account Number" in grouped["PI Type"].values:
         _acct_digits = set(re.sub(r"\D","",str(v)) for v in grouped[grouped["PI Type"]=="Account Number"]["Detected Value"])
         grouped = grouped[~(
