@@ -729,7 +729,7 @@ def emit_grouped_records(file_name: str,
                 "Page/Sheet": page_or_sheet,
                 "Cell": cell,
                 "PI Type": "Name, email",
-                "Detected Value": f"{best}, {email}",
+                "Detected Value": f"{best} ; {email}",
                 "Confidence (%)": 95,
             })
 
@@ -742,7 +742,7 @@ def emit_grouped_records(file_name: str,
                 "Page/Sheet": page_or_sheet,
                 "Cell": cell,
                 "PI Type": "Name, Date of Birth",
-                "Detected Value": f"{best}, {dob}",
+                "Detected Value": f"{best} ; {dob}",
                 "Confidence (%)": 95,
             })
 
@@ -755,7 +755,7 @@ def emit_grouped_records(file_name: str,
                 "Page/Sheet": page_or_sheet,
                 "Cell": cell,
                 "PI Type": "Name, Company ID",
-                "Detected Value": f"{best}, {cid}",
+                "Detected Value": f"{best} ; {cid}",
                 "Confidence (%)": 95,
             })
 
@@ -767,7 +767,7 @@ def emit_grouped_records(file_name: str,
                 "Page/Sheet": page_or_sheet,
                 "Cell": cell,
                 "PI Type": "Name, Phone",
-                "Detected Value": f"{best}, {phone}",
+                "Detected Value": f"{best} ; {phone}",
                 "Confidence (%)": 90,
             })
 
@@ -779,7 +779,7 @@ def emit_grouped_records(file_name: str,
                 "Page/Sheet": page_or_sheet,
                 "Cell": cell,
                 "PI Type": "Name, Phone",
-                "Detected Value": f"{best}, {phone}",
+                "Detected Value": f"{best} ; {phone}",
                 "Confidence (%)": 90,
             })
 
@@ -791,7 +791,7 @@ def emit_grouped_records(file_name: str,
                 "Page/Sheet": page_or_sheet,
                 "Cell": cell,
                 "PI Type": "Name, Address",
-                "Detected Value": f"{best}, {addr}",
+                "Detected Value": f"{best} ; {addr}",
                 "Confidence (%)": 88,
             })
 
@@ -804,7 +804,7 @@ def emit_grouped_records(file_name: str,
                 "Page/Sheet": page_or_sheet,
                 "Cell": cell,
                 "PI Type": "Name, City",
-                "Detected Value": f"{best}, {city}",
+                "Detected Value": f"{best} ; {city}",
                 "Confidence (%)": 85,
             })
 
@@ -832,7 +832,7 @@ def emit_grouped_records(file_name: str,
                 "Page/Sheet": page_or_sheet,
                 "Cell": cell,
                 "PI Type": "Name, State",
-                "Detected Value": f"{best}, {state}",
+                "Detected Value": f"{best} ; {state}",
                 "Confidence (%)": 80,
             })
 
@@ -844,7 +844,7 @@ def emit_grouped_records(file_name: str,
                 "Page/Sheet": page_or_sheet,
                 "Cell": cell,
                 "PI Type": "Name, Gender",
-                "Detected Value": f"{best}, {gender}",
+                "Detected Value": f"{best} ; {gender}",
                 "Confidence (%)": 85,
             })
 
@@ -2224,7 +2224,7 @@ def find_pi_in_excel(excel_file) -> List[Dict[str, Any]]:
             def _emit_pair(pi_type, name, val, col_a, col_b, conf=95):
                 records.append({"File": file_name, "Page/Sheet": sheet_name,
                                  "Cell": f"Row {row_idx + 2}", "PI Type": pi_type,
-                                 "Detected Value": f"{name}, {val}", "Confidence (%)": conf})
+                                 "Detected Value": f"{name} ; {val}", "Confidence (%)": conf})
                 paired_cols.update({col_a, col_b})
 
             if name_val and email_val:
@@ -2794,7 +2794,7 @@ def load_pi_mapping(pi_df: pd.DataFrame, selected_pi_types: List[str]) -> Dict[s
         pi_type = str(row.get("PI Type", "")).strip()
 
         if pi_type in ALL_PAIR_TYPES:
-            parts = [p.strip() for p in val.split(", ", 1)]
+            parts = [p.strip() for p in val.split(" ; ", 1)]
             # first part is always the name
             if parts:
                 _add_name_with_parts(fname, parts[0])
@@ -2812,7 +2812,7 @@ def load_pi_mapping(pi_df: pd.DataFrame, selected_pi_types: List[str]) -> Dict[s
         for _, row in df_all_pairs.iterrows():
             fname = str(row["File"]).strip()
             val   = str(row["Detected Value"]).strip()
-            name_part = val.split(", ", 1)[0].strip()
+            name_part = val.split(" ; ", 1)[0].strip()
             _add_name_with_parts(fname, name_part)
         # also include standalone Person Name rows
         df_pn = pi_df[pi_df['PI Type'] == "Person Name"].dropna(subset=["File", "Detected Value"])
@@ -3620,7 +3620,7 @@ def detect_pi_from_textframe(text_df: pd.DataFrame) -> pd.DataFrame:
                     value=rec["Detected Value"],
                     confidence=rec["Confidence (%)"],
                 )
-                parts = str(rec["Detected Value"]).split(", ", 1)
+                parts = str(rec["Detected Value"]).split(" ; ", 1)
                 name_part = parts[0].strip() if parts else ""
                 val_part  = parts[1].strip() if len(parts) > 1 else ""
                 pair_names.add(name_part.lower())
@@ -3816,7 +3816,7 @@ def clean_pi_data(pi_df: pd.DataFrame) -> pd.DataFrame:
     if "PI Type" in df.columns:
         pair_email_keys: set = set()
         for _, r in df[df["PI Type"] == "Name, email"].iterrows():
-            parts = str(r["Detected Value"]).split(", ", 1)
+            parts = str(r["Detected Value"]).split(" ; ", 1)
             if len(parts) == 2:
                 pair_email_keys.add((str(r["File"]), parts[1].strip()))
         mask_dup_email = df.apply(
@@ -3923,7 +3923,7 @@ def clean_pi_data(pi_df: pd.DataFrame) -> pd.DataFrame:
         # drop standalone email if it already appears in a Name+email pair
         pair_email_keys: set = set()
         for _, r in grouped[grouped["PI Type"] == "Name, email"].iterrows():
-            parts = str(r["Detected Value"]).split(", ", 1)
+            parts = str(r["Detected Value"]).split(" ; ", 1)
             if len(parts) == 2:
                 pair_email_keys.add((str(r["File"]), parts[1].strip()))
         mask_dup = grouped.apply(
@@ -3939,7 +3939,7 @@ def clean_pi_data(pi_df: pd.DataFrame) -> pd.DataFrame:
         _pair_name_keys: set = set()
         _pair_name_words: set = set()  # individual words from paired full names
         for _, _r in grouped[grouped["PI Type"].isin(_ALL_PAIR_TYPES)].iterrows():
-            _name_part = str(_r["Detected Value"]).split(", ", 1)[0].strip()
+            _name_part = str(_r["Detected Value"]).split(" ; ", 1)[0].strip()
             _pair_name_keys.add(str(_r["File"]) + "|" + _name_part.lower())
             # add each word of the full name
             for _w in _name_part.split():
@@ -3963,7 +3963,7 @@ def clean_pi_data(pi_df: pd.DataFrame) -> pd.DataFrame:
     if "PI Type" in grouped.columns and "Date of Birth" in grouped["PI Type"].values:
         _pair_dob_keys: set = set()
         for _, _r in grouped[grouped["PI Type"] == "Name, Date of Birth"].iterrows():
-            _dob_part = str(_r["Detected Value"]).split(", ", 1)
+            _dob_part = str(_r["Detected Value"]).split(" ; ", 1)
             if len(_dob_part) == 2:
                 _pair_dob_keys.add((str(_r["File"]), _dob_part[1].strip()))
         grouped = grouped[~(
@@ -3978,7 +3978,7 @@ def clean_pi_data(pi_df: pd.DataFrame) -> pd.DataFrame:
     if "PI Type" in grouped.columns:
         _pair_phone_keys: set = set()
         for _, _r in grouped[grouped["PI Type"] == "Name, Phone"].iterrows():
-            _p = str(_r["Detected Value"]).split(", ", 1)
+            _p = str(_r["Detected Value"]).split(" ; ", 1)
             if len(_p) == 2:
                 _pair_phone_keys.add((str(_r["File"]), _p[1].strip()))
         for _pt in ("Phone", "Indian Phone"):
@@ -3995,7 +3995,7 @@ def clean_pi_data(pi_df: pd.DataFrame) -> pd.DataFrame:
         _pair_addr_vals: set = set()
         _pair_addr_files: set = set()
         for _, _r in grouped[grouped["PI Type"] == "Name, Address"].iterrows():
-            _a = str(_r["Detected Value"]).split(", ", 1)
+            _a = str(_r["Detected Value"]).split(" ; ", 1)
             if len(_a) == 2:
                 _pair_addr_vals.add((str(_r["File"]), _a[1].strip()))
                 _pair_addr_files.add(str(_r["File"]))
@@ -4026,7 +4026,7 @@ def clean_pi_data(pi_df: pd.DataFrame) -> pd.DataFrame:
     if "PI Type" in grouped.columns and "City" in grouped["PI Type"].values:
         _pair_city_keys: set = set()
         for _, _r in grouped[grouped["PI Type"] == "Name, City"].iterrows():
-            _c = str(_r["Detected Value"]).split(", ", 1)
+            _c = str(_r["Detected Value"]).split(" ; ", 1)
             if len(_c) == 2:
                 _pair_city_keys.add((str(_r["File"]), _c[1].strip().lower()))
         grouped = grouped[~(
@@ -4041,7 +4041,7 @@ def clean_pi_data(pi_df: pd.DataFrame) -> pd.DataFrame:
     if "PI Type" in grouped.columns and "State" in grouped["PI Type"].values:
         _pair_state_keys: set = set()
         for _, _r in grouped[grouped["PI Type"] == "Name, State"].iterrows():
-            _s = str(_r["Detected Value"]).split(", ", 1)
+            _s = str(_r["Detected Value"]).split(" ; ", 1)
             if len(_s) == 2:
                 _pair_state_keys.add((str(_r["File"]), _s[1].strip()))
         # also collect state codes from Name,Address values
@@ -4070,7 +4070,7 @@ def clean_pi_data(pi_df: pd.DataFrame) -> pd.DataFrame:
     if "PI Type" in grouped.columns and "Company ID" in grouped["PI Type"].values:
         _pair_cid_keys: set = set()
         for _, _r in grouped[grouped["PI Type"] == "Name, Company ID"].iterrows():
-            _c = str(_r["Detected Value"]).split(", ", 1)
+            _c = str(_r["Detected Value"]).split(" ; ", 1)
             if len(_c) == 2:
                 _pair_cid_keys.add((str(_r["File"]), _c[1].strip()))
         grouped = grouped[~(
@@ -4085,7 +4085,7 @@ def clean_pi_data(pi_df: pd.DataFrame) -> pd.DataFrame:
     if "PI Type" in grouped.columns and "Gender" in grouped["PI Type"].values:
         _pair_gender_keys: set = set()
         for _, _r in grouped[grouped["PI Type"] == "Name, Gender"].iterrows():
-            _g = str(_r["Detected Value"]).split(", ", 1)
+            _g = str(_r["Detected Value"]).split(" ; ", 1)
             if len(_g) == 2:
                 _pair_gender_keys.add((str(_r["File"]), _g[1].strip().lower()))
         grouped = grouped[~(
