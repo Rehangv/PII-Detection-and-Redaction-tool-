@@ -4081,21 +4081,6 @@ def clean_pi_data(pi_df: pd.DataFrame) -> pd.DataFrame:
             )
         )].copy()
 
-    # suppress standalone Gender if already in a Name,Gender pair
-    if "PI Type" in grouped.columns and "Gender" in grouped["PI Type"].values:
-        _pair_gender_keys: set = set()
-        for _, _r in grouped[grouped["PI Type"] == "Name, Gender"].iterrows():
-            _g = str(_r["Detected Value"]).split(", ", 1)
-            if len(_g) == 2:
-                _pair_gender_keys.add((str(_r["File"]), _g[1].strip().lower()))
-        grouped = grouped[~(
-            (grouped["PI Type"] == "Gender") &
-            grouped.apply(
-                lambda r: (str(r["File"]), str(r["Detected Value"]).strip().lower()) in _pair_gender_keys,
-                axis=1,
-            )
-        )].copy()
-
     # drop Phone values that look like IP address fragments
     import re as _re_phone
     if "Phone" in grouped["PI Type"].values:
